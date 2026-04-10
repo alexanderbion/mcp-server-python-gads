@@ -123,8 +123,15 @@ class BearerAuthMiddleware:
         auth = request.headers.get("authorization", "")
         token = request.query_params.get("token", "")
 
+        # Encode strings to bytes to handle URL-decoded/non-ASCII chars safely
+        valid_bearer = f"Bearer {MCP_API_TOKEN}".encode("utf-8")
+        auth_bytes = auth.encode("utf-8")
+        
+        valid_token = str(MCP_API_TOKEN).encode("utf-8")
+        token_bytes = token.encode("utf-8")
+
         # constant-time comparison to prevent timing side-channel attacks
-        if hmac.compare_digest(auth, f"Bearer {MCP_API_TOKEN}") or hmac.compare_digest(token, MCP_API_TOKEN):
+        if hmac.compare_digest(auth_bytes, valid_bearer) or hmac.compare_digest(token_bytes, valid_token):
             await self.app(scope, receive, send)
             return
 
