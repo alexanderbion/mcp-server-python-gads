@@ -1,5 +1,6 @@
 from typing import List, Dict, Any
 from google.ads.googleads.client import GoogleAdsClient
+from google.protobuf.field_mask_pb2 import FieldMask
 from .client import execute_with_retry
 
 
@@ -19,8 +20,13 @@ def add_negative_keywords(client: GoogleAdsClient, customer_id: str, campaign_id
         criterion.keyword.match_type = getattr(client.enums.KeywordMatchTypeEnum, match_type.upper())
         ops.append(op)
 
-    execute_with_retry(service.mutate_campaign_criteria, customer_id=customer_id, operations=ops, validate_only=True)
-    execute_with_retry(service.mutate_campaign_criteria, customer_id=customer_id, operations=ops)
+    request = client.get_type("MutateCampaignCriteriaRequest")
+    request.customer_id = customer_id
+    request.operations.extend(ops)
+    request.validate_only = True
+    execute_with_retry(service.mutate_campaign_criteria, request=request)
+    request.validate_only = False
+    execute_with_retry(service.mutate_campaign_criteria, request=request)
 
 
 def add_sitelinks_to_campaign(
@@ -45,8 +51,13 @@ def add_sitelinks_to_campaign(
         sitelink_ops.append(asset_op)
 
     # Validate asset creation first
-    execute_with_retry(asset_service.mutate_assets, customer_id=customer_id, operations=sitelink_ops, validate_only=True)
-    response = execute_with_retry(asset_service.mutate_assets, customer_id=customer_id, operations=sitelink_ops)
+    asset_request = client.get_type("MutateAssetsRequest")
+    asset_request.customer_id = customer_id
+    asset_request.operations.extend(sitelink_ops)
+    asset_request.validate_only = True
+    execute_with_retry(asset_service.mutate_assets, request=asset_request)
+    asset_request.validate_only = False
+    response = execute_with_retry(asset_service.mutate_assets, request=asset_request)
 
     link_ops = []
     for result in response.results:
@@ -72,8 +83,13 @@ def add_callouts_to_campaign(
         asset_op.create.callout_asset.callout_text = co["text"][:25]
         callout_ops.append(asset_op)
 
-    execute_with_retry(asset_service.mutate_assets, customer_id=customer_id, operations=callout_ops, validate_only=True)
-    response = execute_with_retry(asset_service.mutate_assets, customer_id=customer_id, operations=callout_ops)
+    asset_request = client.get_type("MutateAssetsRequest")
+    asset_request.customer_id = customer_id
+    asset_request.operations.extend(callout_ops)
+    asset_request.validate_only = True
+    execute_with_retry(asset_service.mutate_assets, request=asset_request)
+    asset_request.validate_only = False
+    response = execute_with_retry(asset_service.mutate_assets, request=asset_request)
 
     link_ops = []
     for result in response.results:
@@ -102,8 +118,13 @@ def add_snippets_to_campaign(
             asset.structured_snippet_asset.values.append(val[:25])
         snippet_ops.append(asset_op)
 
-    execute_with_retry(asset_service.mutate_assets, customer_id=customer_id, operations=snippet_ops, validate_only=True)
-    response = execute_with_retry(asset_service.mutate_assets, customer_id=customer_id, operations=snippet_ops)
+    asset_request = client.get_type("MutateAssetsRequest")
+    asset_request.customer_id = customer_id
+    asset_request.operations.extend(snippet_ops)
+    asset_request.validate_only = True
+    execute_with_retry(asset_service.mutate_assets, request=asset_request)
+    asset_request.validate_only = False
+    response = execute_with_retry(asset_service.mutate_assets, request=asset_request)
 
     link_ops = []
     for result in response.results:
@@ -136,8 +157,13 @@ def add_keywords_to_ad_group(
             criterion.negative = True
         ops.append(op)
 
-    execute_with_retry(service.mutate_ad_group_criteria, customer_id=customer_id, operations=ops, validate_only=True)
-    execute_with_retry(service.mutate_ad_group_criteria, customer_id=customer_id, operations=ops)
+    request = client.get_type("MutateAdGroupCriteriaRequest")
+    request.customer_id = customer_id
+    request.operations.extend(ops)
+    request.validate_only = True
+    execute_with_retry(service.mutate_ad_group_criteria, request=request)
+    request.validate_only = False
+    execute_with_retry(service.mutate_ad_group_criteria, request=request)
 
 
 def update_rsa_ad(
@@ -163,13 +189,18 @@ def update_rsa_ad(
         asset.text = d[:90]
         rsa.descriptions.append(asset)
 
-    field_mask = client.get_type("FieldMask")
+    field_mask = FieldMask()
     field_mask.paths.append("responsive_search_ad.headlines")
     field_mask.paths.append("responsive_search_ad.descriptions")
     op.update_mask.CopyFrom(field_mask)
 
-    execute_with_retry(service.mutate_ads, customer_id=customer_id, operations=[op], validate_only=True)
-    execute_with_retry(service.mutate_ads, customer_id=customer_id, operations=[op])
+    request = client.get_type("MutateAdsRequest")
+    request.customer_id = customer_id
+    request.operations.append(op)
+    request.validate_only = True
+    execute_with_retry(service.mutate_ads, request=request)
+    request.validate_only = False
+    execute_with_retry(service.mutate_ads, request=request)
 
 
 def add_ad_group_negative_keywords(client: GoogleAdsClient, customer_id: str, ad_group_id: str,
@@ -188,8 +219,13 @@ def add_ad_group_negative_keywords(client: GoogleAdsClient, customer_id: str, ad
         criterion.keyword.match_type = getattr(client.enums.KeywordMatchTypeEnum, match_type.upper())
         ops.append(op)
 
-    execute_with_retry(service.mutate_ad_group_criteria, customer_id=customer_id, operations=ops, validate_only=True)
-    execute_with_retry(service.mutate_ad_group_criteria, customer_id=customer_id, operations=ops)
+    request = client.get_type("MutateAdGroupCriteriaRequest")
+    request.customer_id = customer_id
+    request.operations.extend(ops)
+    request.validate_only = True
+    execute_with_retry(service.mutate_ad_group_criteria, request=request)
+    request.validate_only = False
+    execute_with_retry(service.mutate_ad_group_criteria, request=request)
 
 
 def pause_keywords(client: GoogleAdsClient, customer_id: str, operations_list: List[Dict[str, str]]) -> None:
@@ -205,10 +241,15 @@ def pause_keywords(client: GoogleAdsClient, customer_id: str, operations_list: L
             criterion.status = client.enums.AdGroupCriterionStatusEnum.REMOVED
         else:
             criterion.status = client.enums.AdGroupCriterionStatusEnum.PAUSED
-        field_mask = client.get_type("FieldMask")
+        field_mask = FieldMask()
         field_mask.paths.append("status")
         op.update_mask.CopyFrom(field_mask)
         ops.append(op)
 
-    execute_with_retry(service.mutate_ad_group_criteria, customer_id=customer_id, operations=ops, validate_only=True)
-    execute_with_retry(service.mutate_ad_group_criteria, customer_id=customer_id, operations=ops)
+    request = client.get_type("MutateAdGroupCriteriaRequest")
+    request.customer_id = customer_id
+    request.operations.extend(ops)
+    request.validate_only = True
+    execute_with_retry(service.mutate_ad_group_criteria, request=request)
+    request.validate_only = False
+    execute_with_retry(service.mutate_ad_group_criteria, request=request)
