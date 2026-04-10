@@ -1,0 +1,10 @@
+mcp[cli]>=1.0.0
+google-ads
+python-dotenv
+uvicorn[standard]
+starlette
+pytest
+anyio[trio]
+pytest-anyio
+httpx
+asgi-lifespan
