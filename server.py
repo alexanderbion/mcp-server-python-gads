@@ -119,10 +119,12 @@ class BearerAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        headers = dict(scope.get("headers", []))
-        auth = headers.get(b"authorization", b"").decode()
+        request = Request(scope)
+        auth = request.headers.get("authorization", "")
+        token = request.query_params.get("token", "")
+
         # constant-time comparison to prevent timing side-channel attacks
-        if hmac.compare_digest(auth, f"Bearer {MCP_API_TOKEN}"):
+        if hmac.compare_digest(auth, f"Bearer {MCP_API_TOKEN}") or hmac.compare_digest(token, MCP_API_TOKEN):
             await self.app(scope, receive, send)
             return
 
