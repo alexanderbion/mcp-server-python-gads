@@ -12,6 +12,7 @@ from .readers import (
     get_top_search_terms_by_cost,
     get_campaign_negative_keywords,
     get_ad_group_negative_keywords,
+    get_campaign_performance,
 )
 from .updaters import (
     add_negative_keywords,
@@ -20,7 +21,10 @@ from .updaters import (
     add_snippets_to_campaign,
     add_keywords_to_ad_group,
     update_rsa_ad,
-    add_ad_group_negative_keywords,
+    create_rsa_ad,
+    remove_campaign_by_id,
+    remove_ad_by_id,
+    remove_campaign_extensions,
     pause_keywords,
 )
 from .forecasting import get_keyword_forecast_metrics
@@ -36,17 +40,21 @@ __all__ = [
     "get_ad_group_keywords",
     "get_campaign_extensions",
     "get_campaign_targeting",
+    "get_campaign_performance",
     "add_negative_keywords",
     "add_sitelinks_to_campaign",
     "add_callouts_to_campaign",
     "add_snippets_to_campaign",
     "add_keywords_to_ad_group",
     "update_rsa_ad",
+    "create_rsa_ad",
+    "remove_campaign_by_id",
+    "remove_ad_by_id",
+    "remove_campaign_extensions",
     "get_keyword_forecast_metrics",
     "get_top_keywords_by_cost",
     "get_top_search_terms_by_cost",
     "get_campaign_negative_keywords",
     "get_ad_group_negative_keywords",
-    "add_ad_group_negative_keywords",
     "pause_keywords",
 ]
