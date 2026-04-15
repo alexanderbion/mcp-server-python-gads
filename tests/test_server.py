@@ -53,55 +53,30 @@ async def test_health(managed_app):
     assert resp.json() == {"status": "ok"}
 
 
-# ─── Auth tests ────────────────────────────────────────────────────────
+# ─── Auth/Proxy tests ──────────────────────────────────────────────────
 
 
 @pytest.mark.anyio
-async def test_mcp_no_token_when_required(managed_app):
+async def test_mcp_secret_path(managed_app):
+    # The application is mounted at the secret path. 
+    # Claude Web connectors drop auth/query params, so the path itself is the auth.
+    secret_path = "/mcp-primeads-secure-proxy-829xyz"
+    
     async with AsyncClient(
         transport=ASGITransport(app=managed_app), base_url=BASE_URL
     ) as client:
+        # A simple test to check hitting the correct endpoint returns 200 properly.
+        # FastMCP sse_app exposes /sse (GET). We use .stream() to avoid hanging on SSE.
+        async with client.stream("GET", f"{secret_path}/sse") as response:
+            assert response.status_code == 200
+            assert "text/event-stream" in response.headers.get("content-type", "")
+
+@pytest.mark.anyio
+async def test_mcp_wrong_path(managed_app):
+    async with AsyncClient(
+        transport=ASGITransport(app=managed_app), base_url=BASE_URL
+    ) as client:
+        # Hitting standard endpoint without the secret proxy path should 404
         resp = await client.post("/mcp", json=MCP_INIT, headers=MCP_HEADERS)
-    assert resp.status_code == 401
+    assert resp.status_code == 404
 
-
-@pytest.mark.anyio
-async def test_mcp_wrong_token(managed_app):
-    async with AsyncClient(
-        transport=ASGITransport(app=managed_app), base_url=BASE_URL
-    ) as client:
-        headers = {**MCP_HEADERS, "Authorization": "Bearer wrong-token"}
-        resp = await client.post("/mcp", json=MCP_INIT, headers=headers)
-    assert resp.status_code == 401
-
-
-@pytest.mark.anyio
-async def test_mcp_correct_token(managed_app):
-    async with AsyncClient(
-        transport=ASGITransport(app=managed_app), base_url=BASE_URL
-    ) as client:
-        headers = {**MCP_HEADERS, "Authorization": "Bearer test-token"}
-        resp = await client.post("/mcp", json=MCP_INIT, headers=headers)
-    assert resp.status_code == 200
-    data = parse_sse_json(resp.text)
-    assert data.get("result", {}).get("serverInfo", {}).get("name") == "prime-ads"
-
-
-# ─── No-auth mode ─────────────────────────────────────────────────────
-
-
-def test_no_auth_middleware_when_token_unset():
-    """When MCP_API_TOKEN is unset, create_app() does not add BearerAuthMiddleware."""
-    import server as srv
-    saved = srv.MCP_API_TOKEN
-    try:
-        srv.MCP_API_TOKEN = None
-        app = srv.create_app()
-        # Walk the middleware list on the Starlette app object
-        has_bearer = any(
-            hasattr(m, "cls") and m.cls.__name__ == "BearerAuthMiddleware"
-            for m in getattr(app, "middleware", [])
-        )
-        assert not has_bearer
-    finally:
-        srv.MCP_API_TOKEN = saved

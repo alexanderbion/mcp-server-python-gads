@@ -9,14 +9,14 @@ import re
 import asyncio
 import logging
 import functools
-import hmac
 import os
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.routing import Mount, Route
 from google.ads.googleads.errors import GoogleAdsException
 
 from validators import (
@@ -99,53 +99,34 @@ Sitelink text ≤25 chars, sitelink descriptions ≤35 chars. Callouts ≤25 cha
 logger = logging.getLogger("prime-ads")
 
 
-# ─── Health check (bypasses auth) ──────────────────────────────────────
+# ─── Health check ──────────────────────────────────────────────────────
 
 
-@mcp.custom_route("/health", methods=["GET"])
 async def health(request: Request) -> Response:
     return JSONResponse({"status": "ok"})
-
-
-# ─── Bearer token auth middleware ──────────────────────────────────────
-
-
-class BearerAuthMiddleware:
-    def __init__(self, app: ASGIApp) -> None:
-        self.app = app
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send):
-        if scope["type"] != "http" or scope["path"] == "/health":
-            await self.app(scope, receive, send)
-            return
-
-        headers = dict(scope.get("headers", []))
-        auth = headers.get(b"authorization", b"").decode()
-        # constant-time comparison to prevent timing side-channel attacks
-        if hmac.compare_digest(auth, f"Bearer {MCP_API_TOKEN}"):
-            await self.app(scope, receive, send)
-            return
-
-        response = JSONResponse(
-            {
-                "jsonrpc": "2.0",
-                "error": {"code": -32001, "message": "Unauthorized"},
-                "id": None,
-            },
-            status_code=401,
-        )
-        await response(scope, receive, send)
 
 
 # ─── ASGI app factory ─────────────────────────────────────────────────
 
 
 def create_app():
-    app = mcp.streamable_http_app()
-    # When no token is set (local dev), auth is disabled entirely
-    if MCP_API_TOKEN:
-        app.add_middleware(BearerAuthMiddleware)
-    return app
+    # Use sse_app() — Claude Web connectors talk to MCP over SSE.
+    # We must explicitly disable FastMCP's environment-based bearer token middleware
+    # because it causes 401 Unauthorized for Claude Web. We authenticate via secret path instead.
+    original_token = os.environ.pop("MCP_API_TOKEN", None)
+    mcp_app = mcp.sse_app()
+    if original_token is not None:
+        os.environ["MCP_API_TOKEN"] = original_token
+
+    # Mount the MCP server behind a hard-to-guess secret path.
+    # Claude Web connectors drop query params and don't send static bearer
+    # tokens on subsequent POSTs, so the secret URL path is the auth mechanism.
+    secret_path = "/mcp-primeads-secure-proxy-829xyz"
+
+    return Starlette(routes=[
+        Route("/health", health, methods=["GET"]),
+        Mount(secret_path, app=mcp_app),
+    ])
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────
