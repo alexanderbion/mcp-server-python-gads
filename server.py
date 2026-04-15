@@ -68,7 +68,6 @@ RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 
 mcp = FastMCP(
     "prime-ads",
-    stateless_http=True,
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=bool(RENDER_EXTERNAL_HOSTNAME),
         allowed_hosts=[RENDER_EXTERNAL_HOSTNAME] if RENDER_EXTERNAL_HOSTNAME else [],
