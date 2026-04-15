@@ -1,15 +1,7 @@
 import os
-from datetime import date, timedelta
 from typing import List, Dict, Any
 from google.ads.googleads.client import GoogleAdsClient
 from .client import execute_with_retry
-
-
-def _date_range(days: int) -> tuple[str, str]:
-    """Return (start, end) as YYYY-MM-DD strings for GAQL BETWEEN filters."""
-    end = date.today()
-    start = end - timedelta(days=max(days, 1))
-    return start.isoformat(), end.isoformat()
 
 def list_accessible_customers(client: GoogleAdsClient) -> List[Dict[str, Any]]:
     """Lists all customer accounts accessible to the provided credentials."""
@@ -158,7 +150,7 @@ def get_ad_group_keywords(client: GoogleAdsClient, customer_id: str, ad_group_id
     negative = []
     for row in results:
         kw = {
-            "criterion_id": str(row.ad_group_criterion.criterion_id),
+            "id": str(row.ad_group_criterion.criterion_id),
             "text": row.ad_group_criterion.keyword.text,
             "match_type": row.ad_group_criterion.keyword.match_type.name,
         }
@@ -170,13 +162,9 @@ def get_ad_group_keywords(client: GoogleAdsClient, customer_id: str, ad_group_id
 
 
 def get_campaign_extensions(client: GoogleAdsClient, customer_id: str, campaign_id: str) -> Dict[str, List[Any]]:
-    """Gets sitelink, callout, and structured snippet extensions for a campaign.
-
-    Each returned item includes `asset_id` so callers can feed it to remove_extensions.
-    """
+    """Gets sitelink, callout, and structured snippet extensions for a campaign."""
     query = f"""
-        SELECT campaign_asset.field_type, asset.id,
-               asset.sitelink_asset.link_text,
+        SELECT campaign_asset.field_type, asset.sitelink_asset.link_text,
                asset.sitelink_asset.description1, asset.sitelink_asset.description2,
                asset.final_urls, asset.callout_asset.callout_text,
                asset.structured_snippet_asset.header, asset.structured_snippet_asset.values
@@ -196,23 +184,17 @@ def get_campaign_extensions(client: GoogleAdsClient, customer_id: str, campaign_
     structured_snippets = []
     for row in results:
         ft = row.campaign_asset.field_type.name
-        asset_id = str(row.asset.id)
         if ft == "SITELINK":
             sitelinks.append({
-                "asset_id": asset_id,
                 "link_text": row.asset.sitelink_asset.link_text,
                 "description1": row.asset.sitelink_asset.description1,
                 "description2": row.asset.sitelink_asset.description2,
                 "final_urls": list(row.asset.final_urls),
             })
         elif ft == "CALLOUT":
-            callouts.append({
-                "asset_id": asset_id,
-                "text": row.asset.callout_asset.callout_text,
-            })
+            callouts.append({"text": row.asset.callout_asset.callout_text})
         elif ft == "STRUCTURED_SNIPPET":
             structured_snippets.append({
-                "asset_id": asset_id,
                 "header": row.asset.structured_snippet_asset.header,
                 "values": list(row.asset.structured_snippet_asset.values),
             })
@@ -247,11 +229,8 @@ def get_campaign_targeting(client: GoogleAdsClient, customer_id: str, campaign_i
 
 # ── Read functions for Exclusions Tab ─────────────────────────────────
 
-def get_top_keywords_by_cost(
-    client: GoogleAdsClient, customer_id: str, campaign_id: str, days: int = 30
-) -> List[Dict[str, Any]]:
-    """Gets top 50 keywords by cost for a campaign over the given lookback window."""
-    start, end = _date_range(days)
+def get_top_keywords_by_cost(client: GoogleAdsClient, customer_id: str, campaign_id: str) -> List[Dict[str, Any]]:
+    """Gets top 50 keywords by cost for a campaign over the last 30 days."""
     query = f"""
         SELECT
           ad_group_criterion.criterion_id,
@@ -269,7 +248,7 @@ def get_top_keywords_by_cost(
         FROM keyword_view
         WHERE campaign.id = {campaign_id}
           AND ad_group_criterion.status != 'REMOVED'
-          AND segments.date BETWEEN '{start}' AND '{end}'
+          AND segments.date DURING LAST_30_DAYS
         ORDER BY metrics.cost_micros DESC
         LIMIT 50
     """
@@ -298,11 +277,8 @@ def get_top_keywords_by_cost(
     return keywords
 
 
-def get_top_search_terms_by_cost(
-    client: GoogleAdsClient, customer_id: str, campaign_id: str, days: int = 30
-) -> List[Dict[str, Any]]:
-    """Gets top 50 search terms by cost for a campaign over the given lookback window."""
-    start, end = _date_range(days)
+def get_top_search_terms_by_cost(client: GoogleAdsClient, customer_id: str, campaign_id: str) -> List[Dict[str, Any]]:
+    """Gets top 50 search terms by cost for a campaign over the last 30 days."""
     query = f"""
         SELECT
           search_term_view.search_term,
@@ -317,7 +293,7 @@ def get_top_search_terms_by_cost(
           metrics.cost_micros
         FROM search_term_view
         WHERE campaign.id = {campaign_id}
-          AND segments.date BETWEEN '{start}' AND '{end}'
+          AND segments.date DURING LAST_30_DAYS
         ORDER BY metrics.cost_micros DESC
         LIMIT 50
     """
@@ -371,76 +347,6 @@ def get_campaign_negative_keywords(client: GoogleAdsClient, customer_id: str, ca
             "match_type": row.campaign_criterion.keyword.match_type.name,
         })
     return negatives
-
-
-def get_campaign_performance(
-    client: GoogleAdsClient, customer_id: str, campaign_id: str, days: int = 30
-) -> Dict[str, Any]:
-    """Gets aggregate performance metrics for a single campaign over the given lookback window."""
-    start, end = _date_range(days)
-    query = f"""
-        SELECT
-          campaign.id,
-          campaign.name,
-          campaign.status,
-          metrics.impressions,
-          metrics.clicks,
-          metrics.ctr,
-          metrics.average_cpc,
-          metrics.conversions,
-          metrics.all_conversions,
-          metrics.conversions_value,
-          metrics.cost_micros
-        FROM campaign
-        WHERE campaign.id = {campaign_id}
-          AND segments.date BETWEEN '{start}' AND '{end}'
-    """
-    service = client.get_service("GoogleAdsService")
-    request = client.get_type("SearchGoogleAdsRequest")
-    request.customer_id = customer_id
-    request.query = query
-
-    results = execute_with_retry(service.search, request=request)
-
-    impressions = 0
-    clicks = 0
-    conversions = 0.0
-    all_conversions = 0.0
-    conversions_value = 0.0
-    cost_micros = 0
-    name = ""
-    status = ""
-    for row in results:
-        impressions += row.metrics.impressions
-        clicks += row.metrics.clicks
-        conversions += row.metrics.conversions
-        all_conversions += row.metrics.all_conversions
-        conversions_value += row.metrics.conversions_value
-        cost_micros += row.metrics.cost_micros
-        name = row.campaign.name or name
-        status = row.campaign.status.name or status
-
-    cost = cost_micros / 1_000_000
-    ctr = (clicks / impressions) if impressions else 0.0
-    avg_cpc = (cost / clicks) if clicks else 0.0
-    roas = (conversions_value / cost) if cost else 0.0
-
-    return {
-        "campaign_id": str(campaign_id),
-        "campaign_name": name,
-        "status": status,
-        "days": days,
-        "date_range": {"start": start, "end": end},
-        "impressions": impressions,
-        "clicks": clicks,
-        "ctr": round(ctr, 4),
-        "avg_cpc": round(avg_cpc, 2),
-        "conversions": round(conversions, 2),
-        "all_conversions": round(all_conversions, 2),
-        "conversions_value": round(conversions_value, 2),
-        "cost": round(cost, 2),
-        "roas": round(roas, 2),
-    }
 
 
 def get_ad_group_negative_keywords(client: GoogleAdsClient, customer_id: str, campaign_id: str) -> List[Dict[str, Any]]:

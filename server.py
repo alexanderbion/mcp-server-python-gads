@@ -1,10 +1,7 @@
 """
 MCP Server for Google Ads campaign management.
-
-15-tool architecture (v2):
-- 10 core tools (read + add only)
-- 5 restricted tools (update/remove) gated by GOOGLE_ADS_ALLOW_DESTRUCTIVE env var
-  and annotated with destructiveHint=True so MCP clients can warn the user.
+Exposes tools for Claude to create, read, and edit Google Search campaigns
+using the Google Ads API. Deployable on Render with bearer token auth.
 """
 
 import json
@@ -12,13 +9,14 @@ import re
 import asyncio
 import logging
 import functools
+import hmac
 import os
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp.types import ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
+from starlette.types import ASGIApp, Receive, Scope, Send
 from google.ads.googleads.errors import GoogleAdsException
 
 from validators import (
@@ -27,9 +25,12 @@ from validators import (
     validate_descriptions,
     validate_keywords,
     validate_url,
+    validate_match_type,
+    validate_bidding_strategy,
     validate_sitelinks,
     validate_callouts,
     validate_snippets,
+    validate_negative_keyword_texts,
     validate_keyword_actions,
 )
 
@@ -49,15 +50,11 @@ from services.google_ads import (
     add_snippets_to_campaign,
     add_keywords_to_ad_group as gads_add_keywords,
     update_rsa_ad as gads_update_rsa,
-    create_rsa_ad as gads_create_rsa,
-    remove_campaign_by_id as gads_remove_campaign,
-    remove_ad_by_id as gads_remove_ad,
-    remove_campaign_extensions as gads_remove_extensions,
+    add_ad_group_negative_keywords as gads_add_ag_negatives,
     pause_keywords as gads_pause_keywords,
     get_keyword_forecast_metrics,
     get_top_keywords_by_cost,
     get_top_search_terms_by_cost,
-    get_campaign_performance as gads_campaign_performance,
     get_campaign_negative_keywords,
     get_ad_group_negative_keywords as gads_get_ag_negatives,
 )
@@ -66,7 +63,6 @@ from services.google_ads import (
 
 MCP_API_TOKEN = os.environ.get("MCP_API_TOKEN")
 RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
-ALLOW_DESTRUCTIVE = os.environ.get("GOOGLE_ADS_ALLOW_DESTRUCTIVE", "").lower() in {"1", "true", "yes"}
 
 # ─── FastMCP instance ──────────────────────────────────────────────────
 
@@ -83,57 +79,72 @@ mcp = FastMCP(
 Account → Campaign → Ad Group → Ads & Keywords.
 Every write tool needs a customer_id (account). Most also need a campaign_id or ad_group_id.
 
-## Tool tiers
-- **Core (10 tools)** — read and add-only. Always available.
-- **Restricted (5 tools)** — update_ad, remove_keywords, remove_extensions, remove_campaign, remove_ad.
-  These are marked with destructiveHint=True and only enabled when GOOGLE_ADS_ALLOW_DESTRUCTIVE=true.
-
 ## Typical workflows
-- **Browse**: list_accounts → list_campaigns → list_ad_groups → load_campaign
+- **Browse**: list_accounts → list_campaigns → list_ad_groups → get_ads / get_keywords
 - **Create**: create_campaign (everything created PAUSED)
-- **Optimize**: load_campaign → manage_keywords / manage_extensions / create_ad
-- **Performance**: get_performance with report_type="keywords" | "search_terms" | "campaign"
-- **Reduce waste**: get_performance → manage_keywords (add_negative) or remove_keywords (restricted)
+- **Optimize**: load_full_campaign → apply changes with add_keywords, update_ad, add_sitelinks, etc.
+- **Reduce waste**: get_keyword_performance / get_search_term_performance → add_campaign_negatives / modify_keyword_status
 
 ## RSA limits
 Headlines: min 3, max 15, each ≤30 chars. Descriptions: min 2, max 4, each ≤90 chars.
 Sitelink text ≤25 chars, sitelink descriptions ≤35 chars. Callouts ≤25 chars.
 
 ## Important
-- create_campaign and create_ad create everything in PAUSED status — nothing goes live automatically.
-- update_ad REPLACES all headlines/descriptions — always fetch current ad first with load_campaign and merge.
+- create_campaign creates everything in PAUSED status — nothing goes live automatically.
+- update_ad REPLACES all headlines/descriptions — always fetch current ad first and merge.
 - customer_id accepts dashes (e.g. '123-456-7890') — they are stripped automatically.
-- All write paths use validate-then-push: a dry run is always performed before the real mutation.
 """,
 )
 
 logger = logging.getLogger("prime-ads")
 
 
-from starlette.applications import Starlette
-from starlette.routing import Mount, Route
+# ─── Health check (bypasses auth) ──────────────────────────────────────
 
-# ─── Health check ──────────────────────────────────────────────────────
 
+@mcp.custom_route("/health", methods=["GET"])
 async def health(request: Request) -> Response:
     return JSONResponse({"status": "ok"})
 
 
+# ─── Bearer token auth middleware ──────────────────────────────────────
+
+
+class BearerAuthMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] != "http" or scope["path"] == "/health":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", []))
+        auth = headers.get(b"authorization", b"").decode()
+        # constant-time comparison to prevent timing side-channel attacks
+        if hmac.compare_digest(auth, f"Bearer {MCP_API_TOKEN}"):
+            await self.app(scope, receive, send)
+            return
+
+        response = JSONResponse(
+            {
+                "jsonrpc": "2.0",
+                "error": {"code": -32001, "message": "Unauthorized"},
+                "id": None,
+            },
+            status_code=401,
+        )
+        await response(scope, receive, send)
+
+
 # ─── ASGI app factory ─────────────────────────────────────────────────
 
+
 def create_app():
-    # Use sse_app() which natively supports Claude's SSE connection flow
-    mcp_app = mcp.sse_app()
-
-    # Mount the MCP server behind a hard-to-guess secret path.
-    # Claude Web connectors drop query params (like ?token=...) on subsequent
-    # POST requests, so using a secret URL path guarantees secure connection without auth failures.
-    secret_path = "/mcp-primeads-secure-proxy-829xyz"
-
-    app = Starlette(routes=[
-        Route("/health", health, methods=["GET"]),
-        Mount(secret_path, app=mcp_app),
-    ])
+    app = mcp.streamable_http_app()
+    # When no token is set (local dev), auth is disabled entirely
+    if MCP_API_TOKEN:
+        app.add_middleware(BearerAuthMiddleware)
     return app
 
 
@@ -174,18 +185,6 @@ def _check(errors: list[str]) -> str | None:
     return None
 
 
-def _check_destructive_allowed() -> str | None:
-    """Return an error JSON string if destructive tools are disabled, else None."""
-    if not ALLOW_DESTRUCTIVE:
-        return _json({
-            "error": (
-                "Destructive operation refused. Set GOOGLE_ADS_ALLOW_DESTRUCTIVE=true "
-                "on the server to enable update/remove tools."
-            )
-        })
-    return None
-
-
 def _format_google_ads_error(exc: GoogleAdsException) -> str:
     """Extract a readable error message from a GoogleAdsException."""
     errors = []
@@ -219,18 +218,12 @@ def _handle_errors(fn):
     return wrapper
 
 
-READ_ONLY = ToolAnnotations(readOnlyHint=True)
-DESTRUCTIVE = ToolAnnotations(destructiveHint=True)
-
-
 # ═════════════════════════════════════════════════════════════════════════
-# CORE TOOLS — read + add only (always available)
+# READ TOOLS
 # ═════════════════════════════════════════════════════════════════════════
 
 
-# 1. list_accounts ───────────────────────────────────────────────────────
-
-@mcp.tool(annotations=READ_ONLY)
+@mcp.tool()
 @_handle_errors
 async def list_accounts() -> str:
     """List all Google Ads accounts accessible under the configured MCC manager account.
@@ -242,9 +235,7 @@ async def list_accounts() -> str:
     return _json(accounts)
 
 
-# 2. list_campaigns ──────────────────────────────────────────────────────
-
-@mcp.tool(annotations=READ_ONLY)
+@mcp.tool()
 @_handle_errors
 async def list_campaigns(customer_id: str) -> str:
     """List all non-removed SEARCH campaigns for an account.
@@ -259,9 +250,7 @@ async def list_campaigns(customer_id: str) -> str:
     return _json(campaigns)
 
 
-# 3. list_ad_groups ──────────────────────────────────────────────────────
-
-@mcp.tool(annotations=READ_ONLY)
+@mcp.tool()
 @_handle_errors
 async def list_ad_groups(customer_id: str, campaign_id: str) -> str:
     """List all ad groups in a campaign.
@@ -276,97 +265,152 @@ async def list_ad_groups(customer_id: str, campaign_id: str) -> str:
     return _json(groups)
 
 
-# 4. load_campaign ──────────────────────────────────────────────────────
-
-@mcp.tool(annotations=READ_ONLY)
+@mcp.tool()
 @_handle_errors
-async def load_campaign(customer_id: str, campaign_id: str, ad_group_id: str = "") -> str:
-    """Load all data for a campaign in a single call.
-    Returns targeting, extensions, and negative keywords (campaign + ad group level).
-    If ad_group_id is provided, also returns ads and positive/negative keywords for that ad group.
-    Use this before making changes to get a complete picture of the campaign.
+async def get_ads(customer_id: str, ad_group_id: str) -> str:
+    """Get all RSA (Responsive Search Ad) ads in an ad group.
+    Returns headlines, descriptions, final URLs, and status for each ad.
 
     Args:
         customer_id: Google Ads customer ID
-        campaign_id: Campaign to load
-        ad_group_id: Optional ad group ID. If provided, ads and ad-group keywords are included.
+        ad_group_id: The ad group to get ads from
+    """
+    cid = _clean(customer_id, "customer_id")
+    ag = _clean(ad_group_id, "ad_group_id")
+    ads = await asyncio.to_thread(get_ad_group_ads, _client(), cid, ag)
+    return _json(ads)
+
+
+@mcp.tool()
+@_handle_errors
+async def get_keywords(customer_id: str, ad_group_id: str) -> str:
+    """Get all keywords (positive and negative) for an ad group.
+
+    Args:
+        customer_id: Google Ads customer ID
+        ad_group_id: The ad group to get keywords from
+    """
+    cid = _clean(customer_id, "customer_id")
+    ag = _clean(ad_group_id, "ad_group_id")
+    keywords = await asyncio.to_thread(get_ad_group_keywords, _client(), cid, ag)
+    return _json(keywords)
+
+
+@mcp.tool()
+@_handle_errors
+async def get_extensions(customer_id: str, campaign_id: str) -> str:
+    """Get sitelink, callout, and structured snippet extensions for a campaign.
+
+    Args:
+        customer_id: Google Ads customer ID
+        campaign_id: The campaign to get extensions for
     """
     cid = _clean(customer_id, "customer_id")
     camp = _clean(campaign_id, "campaign_id")
-    ag = _clean(ad_group_id, "ad_group_id") if ad_group_id else ""
-    client = _client()
-
-    targeting, extensions, camp_negs, ag_negs = await asyncio.gather(
-        asyncio.to_thread(gads_get_targeting, client, cid, camp),
-        asyncio.to_thread(gads_get_extensions, client, cid, camp),
-        asyncio.to_thread(get_campaign_negative_keywords, client, cid, camp),
-        asyncio.to_thread(gads_get_ag_negatives, client, cid, camp),
-    )
-
-    result = {
-        "targeting": targeting,
-        "extensions": extensions,
-        "negative_keywords": {
-            "campaign_level": camp_negs,
-            "ad_group_level": ag_negs,
-        },
-    }
-
-    if ag:
-        ads, keywords = await asyncio.gather(
-            asyncio.to_thread(get_ad_group_ads, client, cid, ag),
-            asyncio.to_thread(get_ad_group_keywords, client, cid, ag),
-        )
-        result["ads"] = ads
-        result["keywords"] = keywords
-
-    return _json(result)
+    ext = await asyncio.to_thread(gads_get_extensions, _client(), cid, camp)
+    return _json(ext)
 
 
-# 5. get_performance ─────────────────────────────────────────────────────
-
-@mcp.tool(annotations=READ_ONLY)
+@mcp.tool()
 @_handle_errors
-async def get_performance(
-    customer_id: str,
-    campaign_id: str,
-    report_type: str = "keywords",
-    days: int = 30,
-) -> str:
-    """Get performance metrics for a campaign.
-    Returns impressions, clicks, CTR, conversions, and cost over the lookback window.
+async def get_targeting(customer_id: str, campaign_id: str) -> str:
+    """Get geo-location and language targeting settings for a campaign.
+
+    Args:
+        customer_id: Google Ads customer ID
+        campaign_id: The campaign to get targeting for
+    """
+    cid = _clean(customer_id, "customer_id")
+    camp = _clean(campaign_id, "campaign_id")
+    targeting = await asyncio.to_thread(gads_get_targeting, _client(), cid, camp)
+    return _json(targeting)
+
+
+@mcp.tool()
+@_handle_errors
+async def get_keyword_performance(customer_id: str, campaign_id: str) -> str:
+    """Get the top 50 keywords by cost for a campaign over the last 30 days.
+    Returns impressions, clicks, CTR, conversions, and cost for each keyword.
 
     Args:
         customer_id: Google Ads customer ID
         campaign_id: Campaign to analyze
-        report_type: One of "keywords", "search_terms", or "campaign".
-            - "keywords": top 50 keywords by cost, with keyword_text, match_type, ad_group_id.
-            - "search_terms": top 50 search terms (what users actually typed) by cost.
-            - "campaign": single row of aggregate metrics for the whole campaign.
-        days: Lookback window in days (default 30).
     """
     cid = _clean(customer_id, "customer_id")
     camp = _clean(campaign_id, "campaign_id")
-
-    if days <= 0:
-        return _json({"error": "days must be a positive integer"})
-
-    rtype = report_type.lower()
-    if rtype == "keywords":
-        data = await asyncio.to_thread(get_top_keywords_by_cost, _client(), cid, camp, days)
-    elif rtype == "search_terms":
-        data = await asyncio.to_thread(get_top_search_terms_by_cost, _client(), cid, camp, days)
-    elif rtype == "campaign":
-        data = await asyncio.to_thread(gads_campaign_performance, _client(), cid, camp, days)
-    else:
-        return _json({
-            "error": f"report_type '{report_type}' invalid — must be 'keywords', 'search_terms', or 'campaign'"
-        })
-
+    data = await asyncio.to_thread(get_top_keywords_by_cost, _client(), cid, camp)
     return _json(data)
 
 
-# 6. create_campaign ─────────────────────────────────────────────────────
+@mcp.tool()
+@_handle_errors
+async def get_search_term_performance(customer_id: str, campaign_id: str) -> str:
+    """Get the top 50 search terms by cost for a campaign over the last 30 days.
+    Shows what users actually searched for when your ads appeared.
+
+    Args:
+        customer_id: Google Ads customer ID
+        campaign_id: Campaign to analyze
+    """
+    cid = _clean(customer_id, "customer_id")
+    camp = _clean(campaign_id, "campaign_id")
+    data = await asyncio.to_thread(get_top_search_terms_by_cost, _client(), cid, camp)
+    return _json(data)
+
+
+@mcp.tool()
+@_handle_errors
+async def get_negative_keywords(customer_id: str, campaign_id: str) -> str:
+    """Get all negative keywords for a campaign, at both campaign and ad-group level.
+
+    Args:
+        customer_id: Google Ads customer ID
+        campaign_id: Campaign to get negatives for
+    """
+    cid = _clean(customer_id, "customer_id")
+    camp = _clean(campaign_id, "campaign_id")
+    client = _client()
+    camp_negs, ag_negs = await asyncio.gather(
+        asyncio.to_thread(get_campaign_negative_keywords, client, cid, camp),
+        asyncio.to_thread(gads_get_ag_negatives, client, cid, camp),
+    )
+    return _json({"campaign_level": camp_negs, "ad_group_level": ag_negs})
+
+
+@mcp.tool()
+@_handle_errors
+async def load_full_campaign(customer_id: str, campaign_id: str, ad_group_id: str) -> str:
+    """Load all data for a campaign in one call: ads, keywords, extensions, and targeting.
+    Useful for getting a complete picture before making changes.
+
+    Args:
+        customer_id: Google Ads customer ID
+        campaign_id: Campaign ID
+        ad_group_id: Ad group ID to load ads and keywords from
+    """
+    cid = _clean(customer_id, "customer_id")
+    camp = _clean(campaign_id, "campaign_id")
+    ag = _clean(ad_group_id, "ad_group_id")
+    client = _client()
+
+    ads, keywords, extensions, targeting = await asyncio.gather(
+        asyncio.to_thread(get_ad_group_ads, client, cid, ag),
+        asyncio.to_thread(get_ad_group_keywords, client, cid, ag),
+        asyncio.to_thread(gads_get_extensions, client, cid, camp),
+        asyncio.to_thread(gads_get_targeting, client, cid, camp),
+    )
+    return _json({
+        "ads": ads,
+        "keywords": keywords,
+        "extensions": extensions,
+        "targeting": targeting,
+    })
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# WRITE TOOLS — these modify your Google Ads account
+# ═════════════════════════════════════════════════════════════════════════
+
 
 @mcp.tool()
 @_handle_errors
@@ -456,184 +500,237 @@ async def create_campaign(
     })
 
 
-# 7. manage_keywords ─────────────────────────────────────────────────────
-
 @mcp.tool()
 @_handle_errors
-async def manage_keywords(
+async def add_keywords(
     customer_id: str,
-    campaign_id: str,
-    action: str,
-    level: str,
+    ad_group_id: str,
     keywords_json: str,
-    ad_group_id: str = "",
 ) -> str:
-    """Add positive or negative keywords at either campaign or ad group level.
+    """Add keywords to an existing ad group.
 
     Args:
         customer_id: Google Ads customer ID
-        campaign_id: Campaign the keywords belong to
-        action: "add" (positive keywords) or "add_negative" (negative keywords)
-        level: "campaign" or "ad_group"
-        keywords_json: JSON array of {"text": "...", "match_type": "BROAD|PHRASE|EXACT"}
-        ad_group_id: Required when level="ad_group"
-
-    Valid combinations:
-        - action="add",          level="ad_group"  → add positive keywords to the ad group
-        - action="add_negative", level="campaign"  → add campaign-level negative keywords
-        - action="add_negative", level="ad_group"  → add ad-group-level negative keywords
-        (Positive keywords can only be added at ad-group level.)
+        ad_group_id: Ad group to add keywords to
+        keywords_json: JSON array of keywords, each {"text": "...", "match_type": "BROAD|PHRASE|EXACT"}. Add "negative": true for negative keywords.
     """
     cid = _clean(customer_id, "customer_id")
-    camp = _clean(campaign_id, "campaign_id")
-
-    action_n = action.lower()
-    level_n = level.lower()
-
-    if action_n not in {"add", "add_negative"}:
-        return _json({"error": f"action '{action}' invalid — must be 'add' or 'add_negative'"})
-    if level_n not in {"campaign", "ad_group"}:
-        return _json({"error": f"level '{level}' invalid — must be 'campaign' or 'ad_group'"})
-    if action_n == "add" and level_n == "campaign":
-        return _json({"error": "Positive keywords can only be added at ad_group level. Use level='ad_group'."})
-    if level_n == "ad_group" and not ad_group_id:
-        return _json({"error": "ad_group_id is required when level='ad_group'"})
-
+    ag = _clean(ad_group_id, "ad_group_id")
     keywords = _parse_json(keywords_json, "keywords_json")
+
     failed = _check(validate_keywords(keywords))
     if failed:
         return failed
 
-    client = _client()
-
-    if level_n == "campaign":
-        await asyncio.to_thread(gads_add_negatives, client, cid, camp, keywords)
-        return _json({
-            "status": "success",
-            "message": f"Added {len(keywords)} campaign-level negative keywords to campaign {camp}",
-        })
-
-    # ad_group level — positive or negative
-    ag = _clean(ad_group_id, "ad_group_id")
     ag_resource = f"customers/{cid}/adGroups/{ag}"
-    # Mark negatives
-    if action_n == "add_negative":
-        for kw in keywords:
-            kw["negative"] = True
+    await asyncio.to_thread(gads_add_keywords, _client(), cid, ag_resource, keywords)
+    return _json({"status": "success", "message": f"Added {len(keywords)} keywords to ad group {ag}"})
 
-    await asyncio.to_thread(gads_add_keywords, client, cid, ag_resource, keywords)
-    kind = "negative " if action_n == "add_negative" else ""
-    return _json({
-        "status": "success",
-        "message": f"Added {len(keywords)} {kind}keywords to ad group {ag}",
-    })
-
-
-# 8. manage_extensions ───────────────────────────────────────────────────
 
 @mcp.tool()
 @_handle_errors
-async def manage_extensions(
+async def add_campaign_negatives(
     customer_id: str,
     campaign_id: str,
-    type: str,
-    data_json: str,
+    keyword_texts: list[str],
+    match_type: str = "PHRASE",
 ) -> str:
-    """Add sitelinks, callouts, or structured snippets to a campaign.
+    """Add negative keywords to a campaign to prevent ads from showing for irrelevant searches.
 
     Args:
         customer_id: Google Ads customer ID
-        campaign_id: Campaign to add extensions to
-        type: One of "sitelinks", "callouts", "snippets"
-        data_json: JSON array; format depends on type:
-            - "sitelinks": [{"link_text": "..." (≤25), "description1": "..." (≤35), "description2": "..." (≤35), "final_url": "..."}]
-            - "callouts":  [{"text": "..." (≤25)}]
-            - "snippets":  [{"header": "Types|Brands|Services|...", "values": ["a","b","c"]}]
+        campaign_id: Campaign to add negatives to
+        keyword_texts: List of keyword texts to exclude (e.g. ["free", "cheap", "diy"])
+        match_type: Match type for all keywords: BROAD, PHRASE, or EXACT
     """
     cid = _clean(customer_id, "customer_id")
     camp = _clean(campaign_id, "campaign_id")
-    ext_type = type.lower()
 
-    if ext_type not in {"sitelinks", "callouts", "snippets"}:
-        return _json({"error": f"type '{type}' invalid — must be 'sitelinks', 'callouts', or 'snippets'"})
-
-    data = _parse_json(data_json, "data_json")
-    if not isinstance(data, list) or not data:
-        return _json({"error": "data_json must be a non-empty JSON array"})
-
-    client = _client()
-    campaign_resource = f"customers/{cid}/campaigns/{camp}"
-
-    if ext_type == "sitelinks":
-        failed = _check(validate_sitelinks(data))
-        if failed:
-            return failed
-        await asyncio.to_thread(add_sitelinks_to_campaign, client, cid, campaign_resource, data)
-        return _json({"status": "success", "message": f"Added {len(data)} sitelinks to campaign {camp}"})
-
-    if ext_type == "callouts":
-        failed = _check(validate_callouts(data))
-        if failed:
-            return failed
-        # Normalize list[str] → list[{text}] if needed
-        callouts = [c if isinstance(c, dict) else {"text": c} for c in data]
-        await asyncio.to_thread(add_callouts_to_campaign, client, cid, campaign_resource, callouts)
-        return _json({"status": "success", "message": f"Added {len(callouts)} callouts to campaign {camp}"})
-
-    # snippets
-    failed = _check(validate_snippets(data))
-    if failed:
-        return failed
-    await asyncio.to_thread(add_snippets_to_campaign, client, cid, campaign_resource, data)
-    return _json({"status": "success", "message": f"Added {len(data)} structured snippets to campaign {camp}"})
-
-
-# 9. create_ad ──────────────────────────────────────────────────────────
-
-@mcp.tool()
-@_handle_errors
-async def create_ad(
-    customer_id: str,
-    ad_group_id: str,
-    headlines: list[str],
-    descriptions: list[str],
-    final_url: str,
-) -> str:
-    """Create a new RSA (Responsive Search Ad) in an existing ad group. Created in PAUSED status.
-
-    Args:
-        customer_id: Google Ads customer ID
-        ad_group_id: Ad group to create the ad in
-        headlines: List of headlines (3-15, each max 30 chars)
-        descriptions: List of descriptions (2-4, each max 90 chars)
-        final_url: Landing page URL (e.g. 'https://example.com')
-    """
-    cid = _clean(customer_id, "customer_id")
-    ag = _clean(ad_group_id, "ad_group_id")
-
-    errors = validate_headlines(headlines)
-    errors.extend(validate_descriptions(descriptions))
-    errors.extend(validate_url(final_url, "final_url"))
+    errors = validate_negative_keyword_texts(keyword_texts)
+    errors.extend(validate_match_type(match_type))
     failed = _check(errors)
     if failed:
         return failed
 
-    resource = await asyncio.to_thread(
-        gads_create_rsa, _client(), cid, ag, headlines, descriptions, final_url
-    )
-    # resource_name format: customers/{cid}/adGroupAds/{ad_group_id}~{ad_id}
-    ad_id = resource.rsplit("~", 1)[-1] if "~" in resource else ""
+    await asyncio.to_thread(gads_add_negatives, _client(), cid, camp, keyword_texts, match_type.upper())
+    return _json({"status": "success", "message": f"Added {len(keyword_texts)} {match_type} negative keywords to campaign {camp}"})
+
+
+@mcp.tool()
+@_handle_errors
+async def add_ad_group_negatives(
+    customer_id: str,
+    ad_group_id: str,
+    keyword_texts: list[str],
+    match_type: str = "PHRASE",
+) -> str:
+    """Add negative keywords to a specific ad group.
+
+    Args:
+        customer_id: Google Ads customer ID
+        ad_group_id: Ad group to add negatives to
+        keyword_texts: List of keyword texts to exclude
+        match_type: BROAD, PHRASE, or EXACT
+    """
+    cid = _clean(customer_id, "customer_id")
+    ag = _clean(ad_group_id, "ad_group_id")
+
+    errors = validate_negative_keyword_texts(keyword_texts)
+    errors.extend(validate_match_type(match_type))
+    failed = _check(errors)
+    if failed:
+        return failed
+
+    await asyncio.to_thread(gads_add_ag_negatives, _client(), cid, ag, keyword_texts, match_type.upper())
+    return _json({"status": "success", "message": f"Added {len(keyword_texts)} {match_type} negatives to ad group {ag}"})
+
+
+@mcp.tool()
+@_handle_errors
+async def add_sitelinks(
+    customer_id: str,
+    campaign_id: str,
+    sitelinks_json: str,
+) -> str:
+    """Add sitelink extensions to a campaign. Sitelinks appear as additional links below your ad.
+
+    Args:
+        customer_id: Google Ads customer ID
+        campaign_id: Campaign to add sitelinks to
+        sitelinks_json: JSON array of sitelinks, each {"link_text": "..." (max 25 chars), "description1": "..." (max 35 chars), "description2": "..." (max 35 chars), "final_url": "https://..."}
+    """
+    cid = _clean(customer_id, "customer_id")
+    camp = _clean(campaign_id, "campaign_id")
+    sitelinks = _parse_json(sitelinks_json, "sitelinks_json")
+
+    failed = _check(validate_sitelinks(sitelinks))
+    if failed:
+        return failed
+
+    campaign_resource = f"customers/{cid}/campaigns/{camp}"
+    await asyncio.to_thread(add_sitelinks_to_campaign, _client(), cid, campaign_resource, sitelinks)
+    return _json({"status": "success", "message": f"Added {len(sitelinks)} sitelinks to campaign {camp}"})
+
+
+@mcp.tool()
+@_handle_errors
+async def add_callouts(
+    customer_id: str,
+    campaign_id: str,
+    callout_texts: list[str],
+) -> str:
+    """Add callout extensions to a campaign. Callouts are short highlights like 'Free Shipping' or '24/7 Support'.
+
+    Args:
+        customer_id: Google Ads customer ID
+        campaign_id: Campaign to add callouts to
+        callout_texts: List of callout texts (each max 25 chars), e.g. ["Free Shipping", "24/7 Support"]
+    """
+    cid = _clean(customer_id, "customer_id")
+    camp = _clean(campaign_id, "campaign_id")
+
+    failed = _check(validate_callouts(callout_texts))
+    if failed:
+        return failed
+
+    callouts = [{"text": t} for t in callout_texts]
+    campaign_resource = f"customers/{cid}/campaigns/{camp}"
+    await asyncio.to_thread(add_callouts_to_campaign, _client(), cid, campaign_resource, callouts)
+    return _json({"status": "success", "message": f"Added {len(callouts)} callouts to campaign {camp}"})
+
+
+@mcp.tool()
+@_handle_errors
+async def add_structured_snippets(
+    customer_id: str,
+    campaign_id: str,
+    snippets_json: str,
+) -> str:
+    """Add structured snippet extensions to a campaign. Snippets highlight specific aspects of your products/services.
+
+    Args:
+        customer_id: Google Ads customer ID
+        campaign_id: Campaign to add snippets to
+        snippets_json: JSON array of snippets, each {"header": "Types|Brands|Services|...", "values": ["val1", "val2", "val3"]}. Valid headers: Amenities, Brands, Courses, Degree programs, Destinations, Featured hotels, Insurance coverage, Models, Neighborhoods, Service catalog, Shows, Styles, Types.
+    """
+    cid = _clean(customer_id, "customer_id")
+    camp = _clean(campaign_id, "campaign_id")
+    snippets = _parse_json(snippets_json, "snippets_json")
+
+    failed = _check(validate_snippets(snippets))
+    if failed:
+        return failed
+
+    campaign_resource = f"customers/{cid}/campaigns/{camp}"
+    await asyncio.to_thread(add_snippets_to_campaign, _client(), cid, campaign_resource, snippets)
+    return _json({"status": "success", "message": f"Added {len(snippets)} structured snippets to campaign {camp}"})
+
+
+@mcp.tool()
+@_handle_errors
+async def update_ad(
+    customer_id: str,
+    ad_group_id: str,
+    ad_id: str,
+    headlines: list[str],
+    descriptions: list[str],
+) -> str:
+    """Update an RSA ad's headlines and descriptions. This REPLACES all existing headlines and descriptions.
+    Fetch the current ad first with get_ads, merge your changes, then call this.
+
+    Args:
+        customer_id: Google Ads customer ID
+        ad_group_id: Ad group containing the ad
+        ad_id: The ad ID to update
+        headlines: Complete list of headlines (max 15, each max 30 chars)
+        descriptions: Complete list of descriptions (max 4, each max 90 chars)
+    """
+    cid = _clean(customer_id, "customer_id")
+    ag = _clean(ad_group_id, "ad_group_id")
+    aid = _clean(ad_id, "ad_id")
+
+    errors = validate_headlines(headlines)
+    errors.extend(validate_descriptions(descriptions))
+    failed = _check(errors)
+    if failed:
+        return failed
+
+    await asyncio.to_thread(gads_update_rsa, _client(), cid, ag, aid, headlines, descriptions)
     return _json({
         "status": "success",
-        "id": ad_id,
-        "resource_name": resource,
-        "message": f"Created paused RSA ad {ad_id} in ad group {ag} with {len(headlines)} headlines and {len(descriptions)} descriptions",
+        "message": f"Updated ad {aid} with {len(headlines)} headlines and {len(descriptions)} descriptions",
     })
 
 
-# 10. forecast_budget ───────────────────────────────────────────────────
+@mcp.tool()
+@_handle_errors
+async def modify_keyword_status(
+    customer_id: str,
+    actions_json: str,
+) -> str:
+    """Pause or remove keywords from ad groups.
 
-@mcp.tool(annotations=READ_ONLY)
+    Args:
+        customer_id: Google Ads customer ID
+        actions_json: JSON array of actions, each {"ad_group_id": "...", "criterion_id": "...", "action": "PAUSED|REMOVED"}
+    """
+    cid = _clean(customer_id, "customer_id")
+    actions = _parse_json(actions_json, "actions_json")
+
+    failed = _check(validate_keyword_actions(actions))
+    if failed:
+        return failed
+
+    await asyncio.to_thread(gads_pause_keywords, _client(), cid, actions)
+    return _json({"status": "success", "message": f"Applied {len(actions)} keyword status changes"})
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# FORECAST TOOL
+# ═════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
 @_handle_errors
 async def forecast_budget(
     customer_id: str,
@@ -683,180 +780,6 @@ async def forecast_budget(
         "recommended_daily_budget": round(total_monthly_cost / 30.4, 2),
         "keyword_metrics": keyword_breakdown,
     })
-
-
-# ═════════════════════════════════════════════════════════════════════════
-# RESTRICTED TOOLS — update / remove (gated by GOOGLE_ADS_ALLOW_DESTRUCTIVE)
-# ═════════════════════════════════════════════════════════════════════════
-
-
-# 11. update_ad ⚠️ RESTRICTED ──────────────────────────────────────────
-
-@mcp.tool(annotations=DESTRUCTIVE)
-@_handle_errors
-async def update_ad(
-    customer_id: str,
-    ad_group_id: str,
-    ad_id: str,
-    headlines: list[str],
-    descriptions: list[str],
-) -> str:
-    """⚠️ RESTRICTED. Update an RSA ad's headlines and descriptions. REPLACES all existing headlines and descriptions.
-    Always fetch the current ad first with load_campaign, merge your changes, then call this.
-
-    Args:
-        customer_id: Google Ads customer ID
-        ad_group_id: Ad group containing the ad
-        ad_id: The ad ID to update
-        headlines: Complete list of headlines (max 15, each max 30 chars)
-        descriptions: Complete list of descriptions (max 4, each max 90 chars)
-    """
-    blocked = _check_destructive_allowed()
-    if blocked:
-        return blocked
-
-    cid = _clean(customer_id, "customer_id")
-    ag = _clean(ad_group_id, "ad_group_id")
-    aid = _clean(ad_id, "ad_id")
-
-    errors = validate_headlines(headlines)
-    errors.extend(validate_descriptions(descriptions))
-    failed = _check(errors)
-    if failed:
-        return failed
-
-    await asyncio.to_thread(gads_update_rsa, _client(), cid, ag, aid, headlines, descriptions)
-    return _json({
-        "status": "success",
-        "message": f"Updated ad {aid} with {len(headlines)} headlines and {len(descriptions)} descriptions",
-    })
-
-
-# 12. remove_keywords ⚠️ RESTRICTED ────────────────────────────────────
-
-@mcp.tool(annotations=DESTRUCTIVE)
-@_handle_errors
-async def remove_keywords(
-    customer_id: str,
-    actions_json: str,
-) -> str:
-    """⚠️ RESTRICTED. Pause or remove keywords from ad groups. REMOVED is permanent; PAUSED can be re-enabled.
-    Use load_campaign first to get criterion IDs.
-
-    Args:
-        customer_id: Google Ads customer ID
-        actions_json: JSON array of {"ad_group_id": "...", "criterion_id": "...", "action": "PAUSED|REMOVED"}
-    """
-    blocked = _check_destructive_allowed()
-    if blocked:
-        return blocked
-
-    cid = _clean(customer_id, "customer_id")
-    actions = _parse_json(actions_json, "actions_json")
-
-    failed = _check(validate_keyword_actions(actions))
-    if failed:
-        return failed
-
-    await asyncio.to_thread(gads_pause_keywords, _client(), cid, actions)
-    return _json({"status": "success", "message": f"Applied {len(actions)} keyword status changes"})
-
-
-# 13. remove_extensions ⚠️ RESTRICTED ──────────────────────────────────
-
-@mcp.tool(annotations=DESTRUCTIVE)
-@_handle_errors
-async def remove_extensions(
-    customer_id: str,
-    campaign_id: str,
-    type: str,
-    asset_ids: list[str],
-) -> str:
-    """⚠️ RESTRICTED. Unlink sitelinks, callouts, or structured snippets from a campaign.
-    Removes the campaign→asset link; does not delete the underlying asset.
-    Get the IDs from load_campaign — each extension item has an `asset_id` field.
-
-    Args:
-        customer_id: Google Ads customer ID
-        campaign_id: Campaign to remove extensions from
-        type: One of "sitelinks", "callouts", "snippets"
-        asset_ids: List of asset IDs (the `asset_id` values returned by load_campaign) to unlink
-    """
-    blocked = _check_destructive_allowed()
-    if blocked:
-        return blocked
-
-    cid = _clean(customer_id, "customer_id")
-    camp = _clean(campaign_id, "campaign_id")
-
-    if type.lower() not in {"sitelinks", "callouts", "snippets"}:
-        return _json({"error": f"type '{type}' invalid — must be 'sitelinks', 'callouts', or 'snippets'"})
-    if not asset_ids:
-        return _json({"error": "asset_ids must be a non-empty list"})
-
-    cleaned_ids = [_clean(str(a), "asset_id") for a in asset_ids]
-
-    removed = await asyncio.to_thread(
-        gads_remove_extensions, _client(), cid, camp, type.lower(), cleaned_ids
-    )
-    return _json({
-        "status": "success",
-        "removed": removed,
-        "message": f"Removed {removed} {type.lower()} link(s) from campaign {camp}",
-    })
-
-
-# 14. remove_campaign ⚠️ RESTRICTED ────────────────────────────────────
-
-@mcp.tool(annotations=DESTRUCTIVE)
-@_handle_errors
-async def remove_campaign(
-    customer_id: str,
-    campaign_id: str,
-) -> str:
-    """⚠️ RESTRICTED. Remove (delete) a campaign. IRREVERSIBLE.
-
-    Args:
-        customer_id: Google Ads customer ID
-        campaign_id: Campaign to remove
-    """
-    blocked = _check_destructive_allowed()
-    if blocked:
-        return blocked
-
-    cid = _clean(customer_id, "customer_id")
-    camp = _clean(campaign_id, "campaign_id")
-
-    await asyncio.to_thread(gads_remove_campaign, _client(), cid, camp)
-    return _json({"status": "success", "message": f"Campaign {camp} removed"})
-
-
-# 15. remove_ad ⚠️ RESTRICTED ──────────────────────────────────────────
-
-@mcp.tool(annotations=DESTRUCTIVE)
-@_handle_errors
-async def remove_ad(
-    customer_id: str,
-    ad_group_id: str,
-    ad_id: str,
-) -> str:
-    """⚠️ RESTRICTED. Remove an ad from an ad group. Sets ad status to REMOVED.
-
-    Args:
-        customer_id: Google Ads customer ID
-        ad_group_id: Ad group containing the ad
-        ad_id: The ad to remove
-    """
-    blocked = _check_destructive_allowed()
-    if blocked:
-        return blocked
-
-    cid = _clean(customer_id, "customer_id")
-    ag = _clean(ad_group_id, "ad_group_id")
-    aid = _clean(ad_id, "ad_id")
-
-    await asyncio.to_thread(gads_remove_ad, _client(), cid, ag, aid)
-    return _json({"status": "success", "message": f"Ad {aid} removed from ad group {ag}"})
 
 
 # ═════════════════════════════════════════════════════════════════════════
