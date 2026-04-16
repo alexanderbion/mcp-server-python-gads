@@ -248,6 +248,7 @@ def get_top_keywords_by_cost(client: GoogleAdsClient, customer_id: str, campaign
         FROM keyword_view
         WHERE campaign.id = {campaign_id}
           AND ad_group_criterion.status != 'REMOVED'
+          AND ad_group_criterion.negative = FALSE
           AND segments.date DURING LAST_30_DAYS
         ORDER BY metrics.cost_micros DESC
         LIMIT 50

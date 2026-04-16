@@ -134,12 +134,12 @@ def create_paused_campaign(
             )
             mutate_operations.append(kw_op)
 
-    # 7. Negative Keywords
+    # 7. Negative Keywords (campaign-level so they apply to every ad group)
     if negative_keywords:
         for kw in negative_keywords:
             neg_op = client.get_type("MutateOperation")
-            criterion = neg_op.ad_group_criterion_operation.create
-            criterion.ad_group = ad_group_resource
+            criterion = neg_op.campaign_criterion_operation.create
+            criterion.campaign = campaign_resource
             criterion.negative = True
             criterion.keyword.text = kw["text"]
             criterion.keyword.match_type = getattr(

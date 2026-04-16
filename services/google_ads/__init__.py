@@ -23,7 +23,6 @@ from .updaters import (
     add_ad_group_negative_keywords,
     pause_keywords,
 )
-from .forecasting import get_keyword_forecast_metrics
 
 __all__ = [
     "get_google_ads_client",
@@ -42,7 +41,6 @@ __all__ = [
     "add_snippets_to_campaign",
     "add_keywords_to_ad_group",
     "update_rsa_ad",
-    "get_keyword_forecast_metrics",
     "get_top_keywords_by_cost",
     "get_top_search_terms_by_cost",
     "get_campaign_negative_keywords",

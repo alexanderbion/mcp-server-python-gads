@@ -1,6 +1,23 @@
 from typing import List, Dict, Any
 from google.ads.googleads.client import GoogleAdsClient
+from google.protobuf.field_mask_pb2 import FieldMask
 from .client import execute_with_retry
+
+
+def _mutate(client: GoogleAdsClient, service_method, request_type_name: str,
+            customer_id: str, operations: list):
+    """Validate then execute a mutate call using a typed request object.
+
+    v23 SDK no longer accepts validate_only as a kwarg on mutate_* methods —
+    it must be set on the typed request.
+    """
+    request = client.get_type(request_type_name)
+    request.customer_id = customer_id
+    request.operations.extend(operations)
+    request.validate_only = True
+    execute_with_retry(service_method, request=request)
+    request.validate_only = False
+    return execute_with_retry(service_method, request=request)
 
 
 def add_negative_keywords(client: GoogleAdsClient, customer_id: str, campaign_id: str,
@@ -19,8 +36,7 @@ def add_negative_keywords(client: GoogleAdsClient, customer_id: str, campaign_id
         criterion.keyword.match_type = getattr(client.enums.KeywordMatchTypeEnum, match_type.upper())
         ops.append(op)
 
-    execute_with_retry(service.mutate_campaign_criteria, customer_id=customer_id, operations=ops, validate_only=True)
-    execute_with_retry(service.mutate_campaign_criteria, customer_id=customer_id, operations=ops)
+    _mutate(client, service.mutate_campaign_criteria, "MutateCampaignCriteriaRequest", customer_id, ops)
 
 
 def add_sitelinks_to_campaign(
@@ -44,9 +60,7 @@ def add_sitelinks_to_campaign(
         asset.final_urls.append(sl_url)
         sitelink_ops.append(asset_op)
 
-    # Validate asset creation first
-    execute_with_retry(asset_service.mutate_assets, customer_id=customer_id, operations=sitelink_ops, validate_only=True)
-    response = execute_with_retry(asset_service.mutate_assets, customer_id=customer_id, operations=sitelink_ops)
+    response = _mutate(client, asset_service.mutate_assets, "MutateAssetsRequest", customer_id, sitelink_ops)
 
     link_ops = []
     for result in response.results:
@@ -56,7 +70,7 @@ def add_sitelinks_to_campaign(
         link_op.create.field_type = client.enums.AssetFieldTypeEnum.SITELINK
         link_ops.append(link_op)
 
-    execute_with_retry(campaign_asset_service.mutate_campaign_assets, customer_id=customer_id, operations=link_ops)
+    _mutate(client, campaign_asset_service.mutate_campaign_assets, "MutateCampaignAssetsRequest", customer_id, link_ops)
 
 
 def add_callouts_to_campaign(
@@ -72,8 +86,7 @@ def add_callouts_to_campaign(
         asset_op.create.callout_asset.callout_text = co["text"][:25]
         callout_ops.append(asset_op)
 
-    execute_with_retry(asset_service.mutate_assets, customer_id=customer_id, operations=callout_ops, validate_only=True)
-    response = execute_with_retry(asset_service.mutate_assets, customer_id=customer_id, operations=callout_ops)
+    response = _mutate(client, asset_service.mutate_assets, "MutateAssetsRequest", customer_id, callout_ops)
 
     link_ops = []
     for result in response.results:
@@ -83,7 +96,7 @@ def add_callouts_to_campaign(
         link_op.create.field_type = client.enums.AssetFieldTypeEnum.CALLOUT
         link_ops.append(link_op)
 
-    execute_with_retry(campaign_asset_service.mutate_campaign_assets, customer_id=customer_id, operations=link_ops)
+    _mutate(client, campaign_asset_service.mutate_campaign_assets, "MutateCampaignAssetsRequest", customer_id, link_ops)
 
 
 def add_snippets_to_campaign(
@@ -102,8 +115,7 @@ def add_snippets_to_campaign(
             asset.structured_snippet_asset.values.append(val[:25])
         snippet_ops.append(asset_op)
 
-    execute_with_retry(asset_service.mutate_assets, customer_id=customer_id, operations=snippet_ops, validate_only=True)
-    response = execute_with_retry(asset_service.mutate_assets, customer_id=customer_id, operations=snippet_ops)
+    response = _mutate(client, asset_service.mutate_assets, "MutateAssetsRequest", customer_id, snippet_ops)
 
     link_ops = []
     for result in response.results:
@@ -113,7 +125,7 @@ def add_snippets_to_campaign(
         link_op.create.field_type = client.enums.AssetFieldTypeEnum.STRUCTURED_SNIPPET
         link_ops.append(link_op)
 
-    execute_with_retry(campaign_asset_service.mutate_campaign_assets, customer_id=customer_id, operations=link_ops)
+    _mutate(client, campaign_asset_service.mutate_campaign_assets, "MutateCampaignAssetsRequest", customer_id, link_ops)
 
 
 def add_keywords_to_ad_group(
@@ -136,24 +148,37 @@ def add_keywords_to_ad_group(
             criterion.negative = True
         ops.append(op)
 
-    execute_with_retry(service.mutate_ad_group_criteria, customer_id=customer_id, operations=ops, validate_only=True)
-    execute_with_retry(service.mutate_ad_group_criteria, customer_id=customer_id, operations=ops)
+    _mutate(client, service.mutate_ad_group_criteria, "MutateAdGroupCriteriaRequest", customer_id, ops)
 
 
 def update_rsa_ad(
     client: GoogleAdsClient, customer_id: str,
     ad_group_id: str, ad_id: str,
     new_headlines: List[str], new_descriptions: List[str]
-) -> None:
-    """Updates an RSA ad with new headlines and descriptions (replaces all)."""
-    service = client.get_service("AdService")
-    ad_resource = f"customers/{customer_id}/ads/{ad_id}"
+) -> Dict[str, str]:
+    """Replace an RSA ad's headlines/descriptions.
 
-    op = client.get_type("AdOperation")
-    ad = op.update
-    ad.resource_name = ad_resource
+    RSA ad content is immutable in Google Ads — you cannot mutate
+    responsive_search_ad.headlines/descriptions on an existing ad. Instead, this
+    creates a new RSA with the updated content (preserving final_urls and status)
+    and removes the old ad atomically. Returns the new ad_id.
+    """
+    existing = _get_ad_metadata(client, customer_id, ad_group_id, ad_id)
+    if not existing:
+        raise ValueError(f"Ad {ad_id} not found in ad group {ad_group_id}")
 
-    rsa = ad.responsive_search_ad
+    ad_group_resource = f"customers/{customer_id}/adGroups/{ad_group_id}"
+
+    create_op = client.get_type("AdGroupAdOperation")
+    new_ad_group_ad = create_op.create
+    new_ad_group_ad.ad_group = ad_group_resource
+    new_ad_group_ad.status = getattr(
+        client.enums.AdGroupAdStatusEnum, existing["status_name"]
+    )
+    for url in existing["final_urls"]:
+        new_ad_group_ad.ad.final_urls.append(url)
+
+    rsa = new_ad_group_ad.ad.responsive_search_ad
     for h in new_headlines:
         asset = client.get_type("AdTextAsset")
         asset.text = h[:30]
@@ -163,13 +188,42 @@ def update_rsa_ad(
         asset.text = d[:90]
         rsa.descriptions.append(asset)
 
-    field_mask = client.get_type("FieldMask")
-    field_mask.paths.append("responsive_search_ad.headlines")
-    field_mask.paths.append("responsive_search_ad.descriptions")
-    op.update_mask.CopyFrom(field_mask)
+    remove_op = client.get_type("AdGroupAdOperation")
+    remove_op.remove = f"customers/{customer_id}/adGroupAds/{ad_group_id}~{ad_id}"
 
-    execute_with_retry(service.mutate_ads, customer_id=customer_id, operations=[op], validate_only=True)
-    execute_with_retry(service.mutate_ads, customer_id=customer_id, operations=[op])
+    service = client.get_service("AdGroupAdService")
+    response = _mutate(
+        client, service.mutate_ad_group_ads, "MutateAdGroupAdsRequest",
+        customer_id, [create_op, remove_op],
+    )
+
+    new_resource = response.results[0].resource_name
+    new_ad_id = new_resource.split("~")[-1]
+    return {"new_ad_id": new_ad_id, "removed_ad_id": ad_id}
+
+
+def _get_ad_metadata(client: GoogleAdsClient, customer_id: str,
+                    ad_group_id: str, ad_id: str) -> Dict[str, Any] | None:
+    """Fetch final_urls and status of an existing RSA ad."""
+    query = f"""
+        SELECT ad_group_ad.ad.final_urls, ad_group_ad.status
+        FROM ad_group_ad
+        WHERE ad_group_ad.ad_group = 'customers/{customer_id}/adGroups/{ad_group_id}'
+          AND ad_group_ad.ad.id = {ad_id}
+          AND ad_group_ad.status != 'REMOVED'
+        LIMIT 1
+    """
+    service = client.get_service("GoogleAdsService")
+    request = client.get_type("SearchGoogleAdsRequest")
+    request.customer_id = customer_id
+    request.query = query
+    results = execute_with_retry(service.search, request=request)
+    for row in results:
+        return {
+            "final_urls": list(row.ad_group_ad.ad.final_urls),
+            "status_name": row.ad_group_ad.status.name,
+        }
+    return None
 
 
 def add_ad_group_negative_keywords(client: GoogleAdsClient, customer_id: str, ad_group_id: str,
@@ -188,8 +242,7 @@ def add_ad_group_negative_keywords(client: GoogleAdsClient, customer_id: str, ad
         criterion.keyword.match_type = getattr(client.enums.KeywordMatchTypeEnum, match_type.upper())
         ops.append(op)
 
-    execute_with_retry(service.mutate_ad_group_criteria, customer_id=customer_id, operations=ops, validate_only=True)
-    execute_with_retry(service.mutate_ad_group_criteria, customer_id=customer_id, operations=ops)
+    _mutate(client, service.mutate_ad_group_criteria, "MutateAdGroupCriteriaRequest", customer_id, ops)
 
 
 def pause_keywords(client: GoogleAdsClient, customer_id: str, operations_list: List[Dict[str, str]]) -> None:
@@ -205,10 +258,7 @@ def pause_keywords(client: GoogleAdsClient, customer_id: str, operations_list: L
             criterion.status = client.enums.AdGroupCriterionStatusEnum.REMOVED
         else:
             criterion.status = client.enums.AdGroupCriterionStatusEnum.PAUSED
-        field_mask = client.get_type("FieldMask")
-        field_mask.paths.append("status")
-        op.update_mask.CopyFrom(field_mask)
+        op.update_mask.CopyFrom(FieldMask(paths=["status"]))
         ops.append(op)
 
-    execute_with_retry(service.mutate_ad_group_criteria, customer_id=customer_id, operations=ops, validate_only=True)
-    execute_with_retry(service.mutate_ad_group_criteria, customer_id=customer_id, operations=ops)
+    _mutate(client, service.mutate_ad_group_criteria, "MutateAdGroupCriteriaRequest", customer_id, ops)

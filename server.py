@@ -52,7 +52,6 @@ from services.google_ads import (
     update_rsa_ad as gads_update_rsa,
     add_ad_group_negative_keywords as gads_add_ag_negatives,
     pause_keywords as gads_pause_keywords,
-    get_keyword_forecast_metrics,
     get_top_keywords_by_cost,
     get_top_search_terms_by_cost,
     get_campaign_negative_keywords,
@@ -90,7 +89,7 @@ Sitelink text ≤25 chars, sitelink descriptions ≤35 chars. Callouts ≤25 cha
 
 ## Important
 - create_campaign creates everything in PAUSED status — nothing goes live automatically.
-- update_ad REPLACES all headlines/descriptions — always fetch current ad first and merge.
+- update_ad REPLACES the ad: RSAs are immutable, so it creates a new ad with the merged content and removes the old one. The returned new_ad_id replaces the old ad_id. Always fetch the current ad first and merge.
 - customer_id accepts dashes (e.g. '123-456-7890') — they are stripped automatically.
 """,
 )
@@ -421,7 +420,7 @@ async def create_campaign(
         headlines: List of ad headlines (3-15 headlines, each max 30 chars)
         descriptions: List of ad descriptions (2-4 descriptions, each max 90 chars)
         keywords_json: JSON array of keywords, each {"text": "...", "match_type": "BROAD|PHRASE|EXACT"}
-        negative_keywords_json: JSON array of negative keywords, same format as keywords_json
+        negative_keywords_json: JSON array of negative keywords (added at campaign level so they exclude the term across all ad groups), same format as keywords_json
         bidding_strategy: One of MANUAL_CPC, MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS, ENHANCED_CPC
         language_id: Language targeting constant (1000=English, 1003=Spanish, 1001=French)
         geo_target_id: Geo targeting constant (2840=United States, 2826=United Kingdom, 2124=Canada)
@@ -655,13 +654,17 @@ async def update_ad(
     headlines: list[str],
     descriptions: list[str],
 ) -> str:
-    """Update an RSA ad's headlines and descriptions. This REPLACES all existing headlines and descriptions.
+    """Replace an RSA ad's headlines and descriptions.
+
+    RSA ad content is immutable in Google Ads, so this creates a new ad with the
+    updated headlines/descriptions (preserving final_urls and status) and removes
+    the old ad atomically. The returned new_ad_id replaces the passed-in ad_id.
     Fetch the current ad first with get_ads, merge your changes, then call this.
 
     Args:
         customer_id: Google Ads customer ID
         ad_group_id: Ad group containing the ad
-        ad_id: The ad ID to update
+        ad_id: The ad ID to replace
         headlines: Complete list of headlines (max 15, each max 30 chars)
         descriptions: Complete list of descriptions (max 4, each max 90 chars)
     """
@@ -675,10 +678,16 @@ async def update_ad(
     if failed:
         return failed
 
-    await asyncio.to_thread(gads_update_rsa, _client(), cid, ag, aid, headlines, descriptions)
+    result = await asyncio.to_thread(gads_update_rsa, _client(), cid, ag, aid, headlines, descriptions)
     return _json({
         "status": "success",
-        "message": f"Updated ad {aid} with {len(headlines)} headlines and {len(descriptions)} descriptions",
+        "new_ad_id": result["new_ad_id"],
+        "removed_ad_id": result["removed_ad_id"],
+        "message": (
+            f"Replaced ad {aid} with new ad {result['new_ad_id']} "
+            f"({len(headlines)} headlines, {len(descriptions)} descriptions). "
+            f"RSA content is immutable, so a new ad was created and the old one removed."
+        ),
     })
 
 
@@ -703,63 +712,6 @@ async def modify_keyword_status(
 
     await asyncio.to_thread(gads_pause_keywords, _client(), cid, actions)
     return _json({"status": "success", "message": f"Applied {len(actions)} keyword status changes"})
-
-
-# ═════════════════════════════════════════════════════════════════════════
-# FORECAST TOOL
-# ═════════════════════════════════════════════════════════════════════════
-
-
-@mcp.tool()
-@_handle_errors
-async def forecast_budget(
-    customer_id: str,
-    keywords: list[str],
-    target_ctr: float = 3.0,
-    geo_target_id: int = 2840,
-    language_id: int = 1000,
-) -> str:
-    """Forecast monthly budget for a set of keywords based on historical search volume and bid estimates.
-
-    Args:
-        customer_id: Google Ads customer ID
-        keywords: List of keyword texts to forecast (e.g. ["coffee beans", "buy coffee online"])
-        target_ctr: Expected click-through rate as percentage (default 3.0 = 3%)
-        geo_target_id: Geo target (2840=US, 2826=UK, 2124=Canada)
-        language_id: Language (1000=English)
-    """
-    if not keywords:
-        return _json({"total_monthly_budget": 0, "recommended_daily_budget": 0, "keyword_metrics": []})
-
-    cid = _clean(customer_id, "customer_id")
-    metrics_data = await asyncio.to_thread(
-        get_keyword_forecast_metrics, _client(), cid, keywords, geo_target_id, language_id
-    )
-
-    keyword_breakdown = []
-    total_monthly_cost = 0.0
-
-    for m in metrics_data:
-        low_bid = m["low_top_of_page_bid_micros"] / 1_000_000
-        high_bid = m["high_top_of_page_bid_micros"] / 1_000_000
-        avg_cpc = (low_bid + high_bid) / 2 if (low_bid + high_bid) > 0 else 0
-        estimated_clicks = m["avg_monthly_searches"] * (target_ctr / 100)
-        monthly_cost = estimated_clicks * avg_cpc
-        total_monthly_cost += monthly_cost
-
-        keyword_breakdown.append({
-            "keyword": m["keyword"],
-            "monthly_volume": m["avg_monthly_searches"],
-            "avg_cpc": round(avg_cpc, 2),
-            "estimated_clicks": round(estimated_clicks, 2),
-            "monthly_cost": round(monthly_cost, 2),
-        })
-
-    return _json({
-        "total_monthly_budget": round(total_monthly_cost, 2),
-        "recommended_daily_budget": round(total_monthly_cost / 30.4, 2),
-        "keyword_metrics": keyword_breakdown,
-    })
 
 
 # ═════════════════════════════════════════════════════════════════════════
