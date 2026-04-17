@@ -1,7 +1,12 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from google.ads.googleads.client import GoogleAdsClient
 from google.protobuf.field_mask_pb2 import FieldMask
+from google.api_core import protobuf_helpers
 from .client import execute_with_retry
+from .readers import (
+    get_campaign_budget_resource,
+    list_campaign_targeting_criteria,
+)
 
 
 def _mutate(client: GoogleAdsClient, service_method, request_type_name: str,
@@ -262,3 +267,316 @@ def pause_keywords(client: GoogleAdsClient, customer_id: str, operations_list: L
         ops.append(op)
 
     _mutate(client, service.mutate_ad_group_criteria, "MutateAdGroupCriteriaRequest", customer_id, ops)
+
+
+# ─── New consolidated updaters ──────────────────────────────────────────
+
+
+def _apply_bidding_strategy_for_update(
+    client: GoogleAdsClient, campaign, strategy: str,
+    target_cpa: Optional[float], target_roas: Optional[float],
+) -> List[str]:
+    """Apply bidding strategy and return field-mask paths needed."""
+    s = strategy.upper()
+    if s == "MAXIMIZE_CLICKS":
+        client.copy_from(campaign.target_spend, client.get_type("TargetSpend"))
+        return ["target_spend"]
+    if s == "MAXIMIZE_CONVERSIONS":
+        client.copy_from(campaign.maximize_conversions, client.get_type("MaximizeConversions"))
+        return ["maximize_conversions"]
+    if s == "MAXIMIZE_CONVERSION_VALUE":
+        client.copy_from(
+            campaign.maximize_conversion_value, client.get_type("MaximizeConversionValue")
+        )
+        return ["maximize_conversion_value"]
+    if s == "TARGET_CPA":
+        target = client.get_type("TargetCpa")
+        if target_cpa is not None:
+            target.target_cpa_micros = int(round(target_cpa * 1_000_000))
+        client.copy_from(campaign.target_cpa, target)
+        return ["target_cpa.target_cpa_micros"] if target_cpa is not None else ["target_cpa"]
+    if s == "TARGET_ROAS":
+        target = client.get_type("TargetRoas")
+        if target_roas is not None:
+            target.target_roas = target_roas
+        client.copy_from(campaign.target_roas, target)
+        return ["target_roas.target_roas"] if target_roas is not None else ["target_roas"]
+    if s == "ENHANCED_CPC":
+        client.copy_from(campaign.manual_cpc, client.get_type("ManualCpc"))
+        campaign.manual_cpc.enhanced_cpc_enabled = True
+        return ["manual_cpc.enhanced_cpc_enabled"]
+    # MANUAL_CPC default
+    client.copy_from(campaign.manual_cpc, client.get_type("ManualCpc"))
+    return ["manual_cpc"]
+
+
+def update_campaign(
+    client: GoogleAdsClient, customer_id: str, campaign_id: str,
+    name: Optional[str] = None,
+    status: Optional[str] = None,
+    daily_budget: Optional[float] = None,
+    bidding_strategy: Optional[str] = None,
+    target_cpa: Optional[float] = None,
+    target_roas: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Update one or more fields on an existing campaign.
+
+    Builds a dynamic field mask from non-None params. If daily_budget is given,
+    the linked CampaignBudget is mutated separately. Returns
+    {"campaign_id": ..., "updated_fields": [...]} on success.
+    """
+    updated: List[str] = []
+
+    # 1. Budget mutation (separate service)
+    if daily_budget is not None:
+        budget_resource = get_campaign_budget_resource(client, customer_id, campaign_id)
+        if not budget_resource:
+            raise ValueError(
+                f"Could not find campaign_budget for campaign {campaign_id} in account {customer_id}"
+            )
+        budget_service = client.get_service("CampaignBudgetService")
+        budget_op = client.get_type("CampaignBudgetOperation")
+        budget = budget_op.update
+        budget.resource_name = budget_resource
+        budget.amount_micros = int(round(daily_budget * 1_000_000))
+        budget_op.update_mask.CopyFrom(FieldMask(paths=["amount_micros"]))
+        _mutate(
+            client, budget_service.mutate_campaign_budgets,
+            "MutateCampaignBudgetsRequest", customer_id, [budget_op],
+        )
+        updated.append("daily_budget")
+
+    # 2. Campaign-level mutation (name/status/bidding_strategy)
+    needs_campaign_mutation = any(v is not None for v in (name, status, bidding_strategy))
+    if needs_campaign_mutation:
+        campaign_service = client.get_service("CampaignService")
+        op = client.get_type("CampaignOperation")
+        campaign = op.update
+        campaign.resource_name = (
+            f"customers/{customer_id}/campaigns/{campaign_id}"
+        )
+        mask_paths: List[str] = []
+
+        if name is not None:
+            campaign.name = name
+            mask_paths.append("name")
+            updated.append("name")
+        if status is not None:
+            campaign.status = getattr(client.enums.CampaignStatusEnum, status.upper())
+            mask_paths.append("status")
+            updated.append("status")
+        if bidding_strategy is not None:
+            mask_paths.extend(
+                _apply_bidding_strategy_for_update(
+                    client, campaign, bidding_strategy, target_cpa, target_roas
+                )
+            )
+            updated.append("bidding_strategy")
+
+        op.update_mask.CopyFrom(FieldMask(paths=mask_paths))
+        _mutate(
+            client, campaign_service.mutate_campaigns,
+            "MutateCampaignsRequest", customer_id, [op],
+        )
+
+    return {"campaign_id": campaign_id, "updated_fields": updated}
+
+
+def update_targeting(
+    client: GoogleAdsClient, customer_id: str, campaign_id: str,
+    add_geo_target_ids: Optional[List[int]] = None,
+    remove_geo_target_ids: Optional[List[int]] = None,
+    exclude_geo_target_ids: Optional[List[int]] = None,
+    add_language_ids: Optional[List[int]] = None,
+    remove_language_ids: Optional[List[int]] = None,
+) -> Dict[str, Any]:
+    """Add/remove/exclude geo and language targeting criteria on a campaign.
+
+    Returns counts and the IDs actioned. Excludes are added as negative
+    LocationInfo CampaignCriteria — equivalent to the UI's "Location → Exclude".
+    """
+    add_geo_target_ids = add_geo_target_ids or []
+    remove_geo_target_ids = remove_geo_target_ids or []
+    exclude_geo_target_ids = exclude_geo_target_ids or []
+    add_language_ids = add_language_ids or []
+    remove_language_ids = remove_language_ids or []
+
+    service = client.get_service("CampaignCriterionService")
+    campaign_resource = f"customers/{customer_id}/campaigns/{campaign_id}"
+
+    ops = []
+    added_geos: List[int] = []
+    added_langs: List[int] = []
+    excluded_geos: List[int] = []
+    removed_geos: List[int] = []
+    removed_langs: List[int] = []
+
+    # Adds — positive geos
+    for gid in add_geo_target_ids:
+        op = client.get_type("CampaignCriterionOperation")
+        c = op.create
+        c.campaign = campaign_resource
+        c.location.geo_target_constant = f"geoTargetConstants/{gid}"
+        ops.append(op)
+        added_geos.append(gid)
+
+    # Adds — languages
+    for lid in add_language_ids:
+        op = client.get_type("CampaignCriterionOperation")
+        c = op.create
+        c.campaign = campaign_resource
+        c.language.language_constant = f"languageConstants/{lid}"
+        ops.append(op)
+        added_langs.append(lid)
+
+    # Excludes — negative location criteria
+    for gid in exclude_geo_target_ids:
+        op = client.get_type("CampaignCriterionOperation")
+        c = op.create
+        c.campaign = campaign_resource
+        c.negative = True
+        c.location.geo_target_constant = f"geoTargetConstants/{gid}"
+        ops.append(op)
+        excluded_geos.append(gid)
+
+    # Removes — need resource_names from existing criteria
+    if remove_geo_target_ids or remove_language_ids:
+        existing = list_campaign_targeting_criteria(client, customer_id, campaign_id)
+        # Map (type, id, negative) → resource_name; only remove non-negative geos/langs
+        # exclude removes are handled by add-as-negative + future remove call (not in this func)
+        for gid in remove_geo_target_ids:
+            for crit in existing:
+                if (crit["type"] == "LOCATION"
+                        and not crit["negative"]
+                        and crit.get("geo_target_id") == gid):
+                    op = client.get_type("CampaignCriterionOperation")
+                    op.remove = crit["resource_name"]
+                    ops.append(op)
+                    removed_geos.append(gid)
+                    break
+        for lid in remove_language_ids:
+            for crit in existing:
+                if (crit["type"] == "LANGUAGE"
+                        and not crit["negative"]
+                        and crit.get("language_id") == lid):
+                    op = client.get_type("CampaignCriterionOperation")
+                    op.remove = crit["resource_name"]
+                    ops.append(op)
+                    removed_langs.append(lid)
+                    break
+
+    if not ops:
+        raise ValueError("No targeting changes specified — provide at least one ID")
+
+    _mutate(
+        client, service.mutate_campaign_criteria,
+        "MutateCampaignCriteriaRequest", customer_id, ops,
+    )
+
+    return {
+        "added": {"geo_target_ids": added_geos, "language_ids": added_langs},
+        "removed": {"geo_target_ids": removed_geos, "language_ids": removed_langs},
+        "excluded": {"geo_target_ids": excluded_geos},
+    }
+
+
+def add_extensions_to_campaign(
+    client: GoogleAdsClient, customer_id: str, campaign_id: str,
+    sitelinks: Optional[List[Dict[str, Any]]] = None,
+    callouts: Optional[List[Dict[str, str]]] = None,
+    structured_snippets: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, int]:
+    """Add any combination of sitelink/callout/structured-snippet assets and link them to a campaign.
+
+    Returns counts per type added.
+    """
+    sitelinks = sitelinks or []
+    callouts = callouts or []
+    structured_snippets = structured_snippets or []
+    campaign_resource = f"customers/{customer_id}/campaigns/{campaign_id}"
+
+    asset_service = client.get_service("AssetService")
+    campaign_asset_service = client.get_service("CampaignAssetService")
+
+    counts = {"sitelinks": 0, "callouts": 0, "structured_snippets": 0}
+    asset_ops = []
+    # Track ordering so we can map response.results back to extension type
+    types_in_order: List[str] = []
+
+    for sl in sitelinks:
+        asset_op = client.get_type("AssetOperation")
+        a = asset_op.create
+        a.sitelink_asset.link_text = sl["link_text"][:25]
+        a.sitelink_asset.description1 = sl.get("description1", "")[:35]
+        a.sitelink_asset.description2 = sl.get("description2", "")[:35]
+        sl_url = sl.get("final_url", "")
+        if sl_url and not sl_url.startswith(("http://", "https://")):
+            sl_url = "https://" + sl_url
+        if sl_url:
+            a.final_urls.append(sl_url)
+        asset_ops.append(asset_op)
+        types_in_order.append("SITELINK")
+
+    for co in callouts:
+        asset_op = client.get_type("AssetOperation")
+        asset_op.create.callout_asset.callout_text = co["text"][:25]
+        asset_ops.append(asset_op)
+        types_in_order.append("CALLOUT")
+
+    for sn in structured_snippets:
+        asset_op = client.get_type("AssetOperation")
+        a = asset_op.create
+        a.structured_snippet_asset.header = sn["header"]
+        for val in sn.get("values", []):
+            a.structured_snippet_asset.values.append(val[:25])
+        asset_ops.append(asset_op)
+        types_in_order.append("STRUCTURED_SNIPPET")
+
+    if not asset_ops:
+        raise ValueError("Provide at least one of sitelinks/callouts/structured_snippets")
+
+    asset_response = _mutate(
+        client, asset_service.mutate_assets, "MutateAssetsRequest", customer_id, asset_ops,
+    )
+
+    link_ops = []
+    for result, kind in zip(asset_response.results, types_in_order):
+        link_op = client.get_type("CampaignAssetOperation")
+        link_op.create.campaign = campaign_resource
+        link_op.create.asset = result.resource_name
+        if kind == "SITELINK":
+            link_op.create.field_type = client.enums.AssetFieldTypeEnum.SITELINK
+            counts["sitelinks"] += 1
+        elif kind == "CALLOUT":
+            link_op.create.field_type = client.enums.AssetFieldTypeEnum.CALLOUT
+            counts["callouts"] += 1
+        else:
+            link_op.create.field_type = client.enums.AssetFieldTypeEnum.STRUCTURED_SNIPPET
+            counts["structured_snippets"] += 1
+        link_ops.append(link_op)
+
+    _mutate(
+        client, campaign_asset_service.mutate_campaign_assets,
+        "MutateCampaignAssetsRequest", customer_id, link_ops,
+    )
+
+    return counts
+
+
+def add_negatives(
+    client: GoogleAdsClient, customer_id: str, scope: str, parent_id: str,
+    keyword_texts: List[str], match_type: str = "PHRASE",
+) -> Dict[str, Any]:
+    """Add negative keywords at either CAMPAIGN or AD_GROUP scope.
+
+    Routes to the same underlying CampaignCriterionService /
+    AdGroupCriterionService calls used by the prior split tools.
+    """
+    scope_u = scope.upper()
+    if scope_u == "CAMPAIGN":
+        add_negative_keywords(client, customer_id, parent_id, keyword_texts, match_type)
+    elif scope_u == "AD_GROUP":
+        add_ad_group_negative_keywords(client, customer_id, parent_id, keyword_texts, match_type)
+    else:
+        raise ValueError(f"scope must be 'CAMPAIGN' or 'AD_GROUP', got '{scope}'")
+    return {"scope": scope_u, "parent_id": parent_id, "added": len(keyword_texts)}

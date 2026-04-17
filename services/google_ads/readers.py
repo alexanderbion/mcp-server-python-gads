@@ -381,3 +381,208 @@ def get_ad_group_negative_keywords(client: GoogleAdsClient, customer_id: str, ca
             "ad_group_name": row.ad_group.name,
         })
     return negatives
+
+
+# ── Helpers for write ops ───────────────────────────────────────────────
+
+
+def get_campaign_budget_resource(
+    client: GoogleAdsClient, customer_id: str, campaign_id: str
+) -> str | None:
+    """Returns the campaign_budget resource_name for a campaign, or None if not found."""
+    query = f"""
+        SELECT campaign.campaign_budget
+        FROM campaign
+        WHERE campaign.id = {campaign_id}
+        LIMIT 1
+    """
+    service = client.get_service("GoogleAdsService")
+    request = client.get_type("SearchGoogleAdsRequest")
+    request.customer_id = customer_id
+    request.query = query
+    for row in execute_with_retry(service.search, request=request):
+        return row.campaign.campaign_budget
+    return None
+
+
+def list_campaign_targeting_criteria(
+    client: GoogleAdsClient, customer_id: str, campaign_id: str
+) -> List[Dict[str, Any]]:
+    """Returns location/language criteria with their resource_names so they can be removed.
+
+    Includes negative=True location exclusions so update_targeting can also remove
+    excluded geos by ID if needed in the future.
+    """
+    query = f"""
+        SELECT campaign_criterion.resource_name,
+               campaign_criterion.type,
+               campaign_criterion.negative,
+               campaign_criterion.location.geo_target_constant,
+               campaign_criterion.language.language_constant
+        FROM campaign_criterion
+        WHERE campaign_criterion.campaign = 'customers/{customer_id}/campaigns/{campaign_id}'
+          AND campaign_criterion.status != 'REMOVED'
+    """
+    service = client.get_service("GoogleAdsService")
+    request = client.get_type("SearchGoogleAdsRequest")
+    request.customer_id = customer_id
+    request.query = query
+
+    items = []
+    for row in execute_with_retry(service.search, request=request):
+        c = row.campaign_criterion
+        item = {
+            "resource_name": c.resource_name,
+            "type": c.type_.name,
+            "negative": bool(c.negative),
+        }
+        if c.type_.name == "LOCATION":
+            geo = c.location.geo_target_constant
+            item["geo_target_id"] = int(geo.split("/")[-1]) if geo else None
+        elif c.type_.name == "LANGUAGE":
+            lang = c.language.language_constant
+            item["language_id"] = int(lang.split("/")[-1]) if lang else None
+        items.append(item)
+    return items
+
+
+def get_campaign_basic_info(
+    client: GoogleAdsClient, customer_id: str, campaign_id: str
+) -> Dict[str, Any] | None:
+    """Returns name, status, bidding_strategy_type, target_cpa/roas, and budget_micros."""
+    query = f"""
+        SELECT campaign.id, campaign.name, campaign.status,
+               campaign.bidding_strategy_type,
+               campaign.target_cpa.target_cpa_micros,
+               campaign.target_roas.target_roas,
+               campaign_budget.amount_micros
+        FROM campaign
+        WHERE campaign.id = {campaign_id}
+        LIMIT 1
+    """
+    service = client.get_service("GoogleAdsService")
+    request = client.get_type("SearchGoogleAdsRequest")
+    request.customer_id = customer_id
+    request.query = query
+    for row in execute_with_retry(service.search, request=request):
+        return {
+            "id": str(row.campaign.id),
+            "name": row.campaign.name,
+            "status": row.campaign.status.name,
+            "bidding_strategy": row.campaign.bidding_strategy_type.name,
+            "target_cpa_micros": row.campaign.target_cpa.target_cpa_micros,
+            "target_roas": row.campaign.target_roas.target_roas,
+            "budget_micros": row.campaign_budget.amount_micros,
+        }
+    return None
+
+
+def load_campaign_full_config(
+    client: GoogleAdsClient, customer_id: str, campaign_id: str
+) -> Dict[str, Any] | None:
+    """Reads everything needed to clone a campaign.
+
+    Returns a dict with: name, status, bidding_strategy, target_cpa_micros,
+    target_roas, budget_micros, geo_target_ids, language_ids,
+    excluded_geo_target_ids, ip_blocks, campaign_negatives, ad_groups (each
+    with ads, keywords, negative_keywords), extensions.
+    """
+    info = get_campaign_basic_info(client, customer_id, campaign_id)
+    if not info:
+        return None
+
+    # Targeting (positive geos/langs + negative location/IP)
+    targeting_query = f"""
+        SELECT campaign_criterion.type,
+               campaign_criterion.negative,
+               campaign_criterion.location.geo_target_constant,
+               campaign_criterion.language.language_constant,
+               campaign_criterion.ip_block.ip_address
+        FROM campaign_criterion
+        WHERE campaign_criterion.campaign = 'customers/{customer_id}/campaigns/{campaign_id}'
+          AND campaign_criterion.status != 'REMOVED'
+    """
+    service = client.get_service("GoogleAdsService")
+    req = client.get_type("SearchGoogleAdsRequest")
+    req.customer_id = customer_id
+    req.query = targeting_query
+
+    geo_ids: list[int] = []
+    lang_ids: list[int] = []
+    excluded_geos: list[int] = []
+    ip_blocks: list[str] = []
+    for row in execute_with_retry(service.search, request=req):
+        c = row.campaign_criterion
+        t = c.type_.name
+        if t == "LOCATION":
+            geo = c.location.geo_target_constant
+            if not geo:
+                continue
+            gid = int(geo.split("/")[-1])
+            (excluded_geos if c.negative else geo_ids).append(gid)
+        elif t == "LANGUAGE":
+            lang = c.language.language_constant
+            if lang and not c.negative:
+                lang_ids.append(int(lang.split("/")[-1]))
+        elif t == "IP_BLOCK":
+            ip = c.ip_block.ip_address
+            if ip and c.negative:
+                ip_blocks.append(ip)
+
+    # Campaign-level negative keywords
+    campaign_negatives = get_campaign_negative_keywords(client, customer_id, campaign_id)
+    campaign_negs_for_clone = [
+        {"text": n["text"], "match_type": n["match_type"]} for n in campaign_negatives
+    ]
+
+    # Ad groups + each ad group's ads, keywords, negatives
+    ag_query = f"""
+        SELECT ad_group.id, ad_group.name, ad_group.status, ad_group.cpc_bid_micros
+        FROM ad_group
+        WHERE ad_group.campaign = 'customers/{customer_id}/campaigns/{campaign_id}'
+          AND ad_group.status != 'REMOVED'
+        ORDER BY ad_group.name
+    """
+    req = client.get_type("SearchGoogleAdsRequest")
+    req.customer_id = customer_id
+    req.query = ag_query
+
+    ad_groups: list[dict] = []
+    for row in execute_with_retry(service.search, request=req):
+        ag_id = str(row.ad_group.id)
+        ad_groups.append({
+            "id": ag_id,
+            "name": row.ad_group.name,
+            "status": row.ad_group.status.name,
+            "cpc_bid_micros": row.ad_group.cpc_bid_micros,
+            "ads": get_ad_group_ads(client, customer_id, ag_id),
+            "keywords": [],
+            "negative_keywords": [],
+        })
+
+    for ag in ad_groups:
+        kws = get_ad_group_keywords(client, customer_id, ag["id"])
+        ag["keywords"] = [
+            {"text": k["text"], "match_type": k["match_type"]} for k in kws["positive"]
+        ]
+        ag["negative_keywords"] = [
+            {"text": k["text"], "match_type": k["match_type"]} for k in kws["negative"]
+        ]
+
+    extensions = get_campaign_extensions(client, customer_id, campaign_id)
+
+    return {
+        "name": info["name"],
+        "status": info["status"],
+        "bidding_strategy": info["bidding_strategy"],
+        "target_cpa_micros": info["target_cpa_micros"],
+        "target_roas": info["target_roas"],
+        "budget_micros": info["budget_micros"],
+        "geo_target_ids": geo_ids,
+        "language_ids": lang_ids,
+        "excluded_geo_target_ids": excluded_geos,
+        "ip_blocks": ip_blocks,
+        "campaign_negatives": campaign_negs_for_clone,
+        "ad_groups": ad_groups,
+        "extensions": extensions,
+    }

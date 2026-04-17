@@ -14,8 +14,19 @@ VALID_BIDDING_STRATEGIES = {
     "MANUAL_CPC",
     "MAXIMIZE_CLICKS",
     "MAXIMIZE_CONVERSIONS",
+    "MAXIMIZE_CONVERSION_VALUE",
     "ENHANCED_CPC",
+    "TARGET_CPA",
+    "TARGET_ROAS",
 }
+
+VALID_CAMPAIGN_STATUSES = {"ENABLED", "PAUSED", "REMOVED"}
+
+VALID_AD_GROUP_STATUSES = {"ENABLED", "PAUSED", "REMOVED"}
+
+VALID_AD_STATUSES = {"ENABLED", "PAUSED", "REMOVED"}
+
+VALID_NEGATIVE_SCOPES = {"CAMPAIGN", "AD_GROUP"}
 
 VALID_SNIPPET_HEADERS = {
     "Amenities",
@@ -61,6 +72,34 @@ def validate_bidding_strategy(strategy: str) -> list[str]:
     if strategy.upper() not in VALID_BIDDING_STRATEGIES:
         opts = ", ".join(sorted(VALID_BIDDING_STRATEGIES))
         return [f"bidding_strategy: '{strategy}' invalid — must be one of: {opts}"]
+    return []
+
+
+def validate_campaign_status(status: str, field: str = "status") -> list[str]:
+    if status.upper() not in VALID_CAMPAIGN_STATUSES:
+        opts = ", ".join(sorted(VALID_CAMPAIGN_STATUSES))
+        return [f"{field}: '{status}' invalid — must be one of: {opts}"]
+    return []
+
+
+def validate_ad_group_status(status: str, field: str = "status") -> list[str]:
+    if status.upper() not in VALID_AD_GROUP_STATUSES:
+        opts = ", ".join(sorted(VALID_AD_GROUP_STATUSES))
+        return [f"{field}: '{status}' invalid — must be one of: {opts}"]
+    return []
+
+
+def validate_ad_status(status: str, field: str = "status") -> list[str]:
+    if status.upper() not in VALID_AD_STATUSES:
+        opts = ", ".join(sorted(VALID_AD_STATUSES))
+        return [f"{field}: '{status}' invalid — must be one of: {opts}"]
+    return []
+
+
+def validate_scope(scope: str, field: str = "scope") -> list[str]:
+    if scope.upper() not in VALID_NEGATIVE_SCOPES:
+        opts = ", ".join(sorted(VALID_NEGATIVE_SCOPES))
+        return [f"{field}: '{scope}' invalid — must be one of: {opts}"]
     return []
 
 
@@ -282,12 +321,13 @@ def validate_keyword_actions(actions: list, field: str = "actions") -> list[str]
 def validate_campaign(
     *,
     campaign_name: str,
-    daily_budget_usd: float,
+    daily_budget: float,
     url: str,
     headlines: list,
     descriptions: list,
     keywords: list,
-    negative_keywords: list,
+    campaign_negative_keywords: list,
+    ad_group_negative_keywords: list,
     bidding_strategy: str,
     sitelinks: list,
     callouts: list,
@@ -297,17 +337,19 @@ def validate_campaign(
     errors = []
     if not campaign_name or not campaign_name.strip():
         errors.append("campaign_name: cannot be empty")
-    if daily_budget_usd <= 0:
+    if daily_budget <= 0:
         errors.append(
-            f"daily_budget_usd: must be greater than 0, got {daily_budget_usd}"
+            f"daily_budget: must be greater than 0, got {daily_budget}"
         )
     errors.extend(validate_url(url))
     errors.extend(validate_headlines(headlines))
     errors.extend(validate_descriptions(descriptions))
     errors.extend(validate_keywords(keywords, "keywords"))
     errors.extend(validate_bidding_strategy(bidding_strategy))
-    if negative_keywords:
-        errors.extend(validate_keywords(negative_keywords, "negative_keywords"))
+    if campaign_negative_keywords:
+        errors.extend(validate_keywords(campaign_negative_keywords, "campaign_negative_keywords"))
+    if ad_group_negative_keywords:
+        errors.extend(validate_keywords(ad_group_negative_keywords, "ad_group_negative_keywords"))
     if sitelinks:
         errors.extend(validate_sitelinks(sitelinks))
     if callouts:

@@ -1,5 +1,10 @@
 from .client import get_google_ads_client, execute_with_retry
-from .builder import create_paused_campaign
+from .builder import (
+    create_paused_campaign,
+    add_ad_group,
+    create_rsa_ad,
+    clone_campaign,
+)
 from .readers import (
     list_accessible_customers,
     list_campaigns,
@@ -12,6 +17,10 @@ from .readers import (
     get_top_search_terms_by_cost,
     get_campaign_negative_keywords,
     get_ad_group_negative_keywords,
+    get_campaign_budget_resource,
+    get_campaign_basic_info,
+    list_campaign_targeting_criteria,
+    load_campaign_full_config,
 )
 from .updaters import (
     add_negative_keywords,
@@ -22,12 +31,19 @@ from .updaters import (
     update_rsa_ad,
     add_ad_group_negative_keywords,
     pause_keywords,
+    update_campaign,
+    update_targeting,
+    add_extensions_to_campaign,
+    add_negatives,
 )
 
 __all__ = [
     "get_google_ads_client",
     "execute_with_retry",
     "create_paused_campaign",
+    "add_ad_group",
+    "create_rsa_ad",
+    "clone_campaign",
     "list_accessible_customers",
     "list_campaigns",
     "list_ad_groups",
@@ -47,4 +63,12 @@ __all__ = [
     "get_ad_group_negative_keywords",
     "add_ad_group_negative_keywords",
     "pause_keywords",
+    "get_campaign_budget_resource",
+    "get_campaign_basic_info",
+    "list_campaign_targeting_criteria",
+    "load_campaign_full_config",
+    "update_campaign",
+    "update_targeting",
+    "add_extensions_to_campaign",
+    "add_negatives",
 ]
