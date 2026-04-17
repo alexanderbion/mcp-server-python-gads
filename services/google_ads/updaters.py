@@ -287,41 +287,48 @@ def _apply_bidding_strategy_for_update(
 ) -> List[str]:
     """Set the right oneof submessage for a bidding-strategy switch and return mask paths.
 
-    Two valid mask shapes:
-      - Empty submessage (no concrete subfield set) → mask path is the parent
-        ('target_spend'). Tells the API "switch strategy, use defaults". Setting
-        zero-valued subfields like cpc_bid_ceiling_micros=0 is rejected as
-        "Too low" — Google Ads reads 0 as a literal $0 cap.
-      - Submessage with a populated subfield → mask path includes the subfield
-        ('target_cpa.target_cpa_micros'). Required for TARGET_CPA/TARGET_ROAS
-        which can't run without a concrete target value.
+    Follows Google's official empty-message-fields pattern:
+    https://developers.google.com/google-ads/api/docs/client-libs/python/empty-message-fields
+
+    Assign an empty instance of the strategy submessage to the parent oneof
+    field, then append a SUBFIELD path (not the parent) to the update mask.
+    The mask-with-subfield-path tells the API which oneof branch to activate;
+    the subfield itself stays at its proto3-optional unset state, which the
+    API interprets as "select this strategy with default settings".
+
+    TARGET_CPA / TARGET_ROAS are routed through MaximizeConversions /
+    MaximizeConversionValue with the optional target subfield populated —
+    standalone TargetCpa / TargetRoas were deprecated for Search campaigns
+    in September 2021:
+    https://ads-developers.googleblog.com/2021/07/updates-to-how-google-ads-api-smart.html
     """
     s = strategy.upper()
-    # SetInParent must be called on the raw proto (._pb), not the proto-plus
-    # wrapper — the wrapper interprets attribute access as a field lookup and
-    # raises "Unknown field for <Strategy>: SetInParent" otherwise.
+    if s == "MANUAL_CPC":
+        campaign.manual_cpc = client.get_type("ManualCpc")
+        return ["manual_cpc.enhanced_cpc_enabled"]
     if s == "MAXIMIZE_CLICKS":
-        campaign.target_spend._pb.SetInParent()
-        return ["target_spend"]
+        campaign.target_spend = client.get_type("TargetSpend")
+        return ["target_spend.cpc_bid_ceiling_micros"]
     if s == "MAXIMIZE_CONVERSIONS":
-        campaign.maximize_conversions._pb.SetInParent()
-        return ["maximize_conversions"]
+        campaign.maximize_conversions = client.get_type("MaximizeConversions")
+        return ["maximize_conversions.target_cpa_micros"]
     if s == "MAXIMIZE_CONVERSION_VALUE":
-        campaign.maximize_conversion_value._pb.SetInParent()
-        return ["maximize_conversion_value"]
+        campaign.maximize_conversion_value = client.get_type("MaximizeConversionValue")
+        return ["maximize_conversion_value.target_roas"]
     if s == "TARGET_CPA":
         if target_cpa is None:
             raise ValueError("target_cpa is required when bidding_strategy=TARGET_CPA")
-        campaign.target_cpa.target_cpa_micros = int(round(target_cpa * 1_000_000))
-        return ["target_cpa.target_cpa_micros"]
+        mc = client.get_type("MaximizeConversions")
+        mc.target_cpa_micros = int(round(target_cpa * 1_000_000))
+        campaign.maximize_conversions = mc
+        return ["maximize_conversions.target_cpa_micros"]
     if s == "TARGET_ROAS":
         if target_roas is None:
             raise ValueError("target_roas is required when bidding_strategy=TARGET_ROAS")
-        campaign.target_roas.target_roas = target_roas
-        return ["target_roas.target_roas"]
-    if s == "MANUAL_CPC":
-        campaign.manual_cpc._pb.SetInParent()
-        return ["manual_cpc"]
+        mcv = client.get_type("MaximizeConversionValue")
+        mcv.target_roas = target_roas
+        campaign.maximize_conversion_value = mcv
+        return ["maximize_conversion_value.target_roas"]
     raise ValueError(
         f"Unsupported bidding_strategy: '{strategy}'. "
         "Use MANUAL_CPC, MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS, "
@@ -412,14 +419,16 @@ def update_campaign(
                 "MutateCampaignsRequest", customer_id, [op],
             )
         except GoogleAdsException as e:
-            # TARGET_CPA / TARGET_ROAS need real conversion history. The sandbox
-            # (and any new account) returns "operation is not allowed for the
-            # given context" — a Google Ads constraint, not a fixable bug. Raise
-            # a ValueError so the server's error handler returns an error-only
-            # response (no contradictory status: success envelope).
+            # TARGET_CPA / TARGET_ROAS need real conversion history. After R6
+            # routing they go through MaximizeConversions / MaximizeConversionValue,
+            # so the sandbox now returns "Conversion tracking is not enabled"
+            # (the legacy standalone path returned "operation is not allowed").
+            # Catch either and raise a ValueError so the server's error handler
+            # returns an error-only response (no contradictory status: success).
             if bidding_strategy_upper in ("TARGET_CPA", "TARGET_ROAS"):
                 for err in e.failure.errors:
-                    if "operation is not allowed" in err.message.lower():
+                    msg = err.message.lower()
+                    if "operation is not allowed" in msg or "conversion tracking is not enabled" in msg:
                         raise ValueError(
                             f"{bidding_strategy_upper} requires conversion history on the account. "
                             "If this is a new account or sandbox with no conversion data, "

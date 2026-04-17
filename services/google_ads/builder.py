@@ -41,7 +41,14 @@ def _apply_bidding_strategy(
     target_cpa: Optional[float] = None,
     target_roas: Optional[float] = None,
 ) -> None:
-    """Apply a bidding strategy to a campaign proto by setting the right oneof field."""
+    """Apply a bidding strategy to a campaign proto by setting the right oneof field.
+
+    TARGET_CPA / TARGET_ROAS are routed through MaximizeConversions /
+    MaximizeConversionValue with the optional target subfield populated —
+    standalone TargetCpa / TargetRoas were deprecated for Search campaigns
+    in September 2021:
+    https://ads-developers.googleblog.com/2021/07/updates-to-how-google-ads-api-smart.html
+    """
     s = strategy.upper()
     if s == "ENHANCED_CPC":
         raise ValueError(
@@ -49,23 +56,25 @@ def _apply_bidding_strategy(
             "Use MAXIMIZE_CONVERSIONS or MAXIMIZE_CONVERSION_VALUE instead."
         )
     if s == "MAXIMIZE_CLICKS":
-        client.copy_from(campaign.target_spend, client.get_type("TargetSpend"))
+        campaign.target_spend = client.get_type("TargetSpend")
     elif s == "MAXIMIZE_CONVERSIONS":
-        client.copy_from(campaign.maximize_conversions, client.get_type("MaximizeConversions"))
+        campaign.maximize_conversions = client.get_type("MaximizeConversions")
     elif s == "MAXIMIZE_CONVERSION_VALUE":
-        client.copy_from(campaign.maximize_conversion_value, client.get_type("MaximizeConversionValue"))
+        campaign.maximize_conversion_value = client.get_type("MaximizeConversionValue")
     elif s == "TARGET_CPA":
-        target = client.get_type("TargetCpa")
-        if target_cpa is not None:
-            target.target_cpa_micros = int(round(target_cpa * 1_000_000))
-        client.copy_from(campaign.target_cpa, target)
+        if target_cpa is None:
+            raise ValueError("target_cpa is required when bidding_strategy=TARGET_CPA")
+        mc = client.get_type("MaximizeConversions")
+        mc.target_cpa_micros = int(round(target_cpa * 1_000_000))
+        campaign.maximize_conversions = mc
     elif s == "TARGET_ROAS":
-        target = client.get_type("TargetRoas")
-        if target_roas is not None:
-            target.target_roas = target_roas
-        client.copy_from(campaign.target_roas, target)
+        if target_roas is None:
+            raise ValueError("target_roas is required when bidding_strategy=TARGET_ROAS")
+        mcv = client.get_type("MaximizeConversionValue")
+        mcv.target_roas = target_roas
+        campaign.maximize_conversion_value = mcv
     else:
-        client.copy_from(campaign.manual_cpc, client.get_type("ManualCpc"))
+        campaign.manual_cpc = client.get_type("ManualCpc")
 
 
 # ─── URL helper ─────────────────────────────────────────────────────────
