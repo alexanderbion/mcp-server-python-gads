@@ -280,7 +280,9 @@ def create_paused_campaign(
     next_temp_id = _make_temp_id_factory()
     mutate_operations = []
 
-    # 1. Budget
+    # 1. Budget — explicitly_shared=False so Smart Bidding strategies that require
+    # a dedicated budget (MAXIMIZE_CONVERSIONS, MAXIMIZE_CONVERSION_VALUE, TARGET_*)
+    # don't get rejected with "incompatible with shared budget".
     budget_resource = f"customers/{customer_id}/campaignBudgets/{next_temp_id()}"
     budget_op = client.get_type("MutateOperation")
     budget = budget_op.campaign_budget_operation.create
@@ -288,6 +290,7 @@ def create_paused_campaign(
     budget.name = f"Budget for {campaign_name} ({int(time.time())})"
     budget.amount_micros = budget_micros
     budget.delivery_method = client.enums.BudgetDeliveryMethodEnum.STANDARD
+    budget.explicitly_shared = False
     mutate_operations.append(budget_op)
 
     # 2. Campaign
@@ -506,7 +509,8 @@ def clone_campaign(
     next_temp_id = _make_temp_id_factory()
     mutate_operations = []
 
-    # 1. Budget
+    # 1. Budget — explicitly_shared=False so Smart Bidding strategies that require
+    # a dedicated budget don't get rejected with "incompatible with shared budget".
     budget_resource = f"customers/{customer_id}/campaignBudgets/{next_temp_id()}"
     budget_op = client.get_type("MutateOperation")
     budget = budget_op.campaign_budget_operation.create
@@ -514,6 +518,7 @@ def clone_campaign(
     budget.name = f"Budget for {new_campaign_name} ({int(time.time())})"
     budget.amount_micros = budget_micros
     budget.delivery_method = client.enums.BudgetDeliveryMethodEnum.STANDARD
+    budget.explicitly_shared = False
     mutate_operations.append(budget_op)
 
     # 2. Campaign

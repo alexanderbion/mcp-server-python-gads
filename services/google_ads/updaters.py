@@ -1,5 +1,6 @@
 from typing import List, Dict, Any, Optional
 from google.ads.googleads.client import GoogleAdsClient
+from google.ads.googleads.errors import GoogleAdsException
 from google.protobuf.field_mask_pb2 import FieldMask
 from google.api_core import protobuf_helpers
 from .client import execute_with_retry
@@ -272,29 +273,39 @@ def pause_keywords(client: GoogleAdsClient, customer_id: str, operations_list: L
 # ─── New consolidated updaters ──────────────────────────────────────────
 
 
+SMART_BIDDING_DEDICATED_BUDGET = {
+    "MAXIMIZE_CONVERSIONS",
+    "MAXIMIZE_CONVERSION_VALUE",
+    "TARGET_CPA",
+    "TARGET_ROAS",
+}
+
+
 def _apply_bidding_strategy_for_update(
     client: GoogleAdsClient, campaign, strategy: str,
     target_cpa: Optional[float], target_roas: Optional[float],
 ) -> List[str]:
     """Set the right oneof submessage for a bidding-strategy switch and return mask paths.
 
-    Google Ads rejects parent-message paths in field masks (e.g. 'target_spend')
-    with "field mask updated a field with subfields" — paths must reach into a
-    subfield (e.g. 'target_spend.cpc_bid_ceiling_micros'). For strategies whose
-    only configurable field defaults to 0/False we still set + include the
-    subfield path explicitly; the API uses the populated oneof to switch
-    strategy regardless of the subfield value.
+    Two valid mask shapes:
+      - Empty submessage (no concrete subfield set) → mask path is the parent
+        ('target_spend'). Tells the API "switch strategy, use defaults". Setting
+        zero-valued subfields like cpc_bid_ceiling_micros=0 is rejected as
+        "Too low" — Google Ads reads 0 as a literal $0 cap.
+      - Submessage with a populated subfield → mask path includes the subfield
+        ('target_cpa.target_cpa_micros'). Required for TARGET_CPA/TARGET_ROAS
+        which can't run without a concrete target value.
     """
     s = strategy.upper()
     if s == "MAXIMIZE_CLICKS":
-        campaign.target_spend.cpc_bid_ceiling_micros = 0
-        return ["target_spend.cpc_bid_ceiling_micros"]
+        campaign.target_spend.SetInParent()
+        return ["target_spend"]
     if s == "MAXIMIZE_CONVERSIONS":
-        campaign.maximize_conversions.target_cpa_micros = 0
-        return ["maximize_conversions.target_cpa_micros"]
+        campaign.maximize_conversions.SetInParent()
+        return ["maximize_conversions"]
     if s == "MAXIMIZE_CONVERSION_VALUE":
-        campaign.maximize_conversion_value.target_roas = 0.0
-        return ["maximize_conversion_value.target_roas"]
+        campaign.maximize_conversion_value.SetInParent()
+        return ["maximize_conversion_value"]
     if s == "TARGET_CPA":
         if target_cpa is None:
             raise ValueError("target_cpa is required when bidding_strategy=TARGET_CPA")
@@ -306,8 +317,8 @@ def _apply_bidding_strategy_for_update(
         campaign.target_roas.target_roas = target_roas
         return ["target_roas.target_roas"]
     if s == "MANUAL_CPC":
-        campaign.manual_cpc.enhanced_cpc_enabled = False
-        return ["manual_cpc.enhanced_cpc_enabled"]
+        campaign.manual_cpc.SetInParent()
+        return ["manual_cpc"]
     raise ValueError(
         f"Unsupported bidding_strategy: '{strategy}'. "
         "Use MANUAL_CPC, MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS, "
@@ -327,13 +338,20 @@ def update_campaign(
     """Update one or more fields on an existing campaign.
 
     Builds a dynamic field mask from non-None params. If daily_budget is given,
-    the linked CampaignBudget is mutated separately. Returns
-    {"campaign_id": ..., "updated_fields": [...]} on success.
+    the linked CampaignBudget is mutated separately. When switching to a Smart
+    Bidding strategy that requires a dedicated budget, the budget's
+    explicitly_shared flag is also flipped to False (legacy budgets created
+    with the API default may be shared). Returns
+    {"campaign_id": ..., "updated_fields": [...]} on success, or
+    {"campaign_id": ..., "updated_fields": [...], "error": "..."} for the
+    sandbox-only TARGET_CPA/TARGET_ROAS conversion-history rejection.
     """
     updated: List[str] = []
 
-    # 1. Budget mutation (separate service)
-    if daily_budget is not None:
+    # 1. Budget mutation (combine amount + explicitly_shared flip when needed)
+    bidding_strategy_upper = bidding_strategy.upper() if bidding_strategy else None
+    needs_budget_flip = bidding_strategy_upper in SMART_BIDDING_DEDICATED_BUDGET
+    if daily_budget is not None or needs_budget_flip:
         budget_resource = get_campaign_budget_resource(client, customer_id, campaign_id)
         if not budget_resource:
             raise ValueError(
@@ -343,13 +361,19 @@ def update_campaign(
         budget_op = client.get_type("CampaignBudgetOperation")
         budget = budget_op.update
         budget.resource_name = budget_resource
-        budget.amount_micros = int(round(daily_budget * 1_000_000))
-        budget_op.update_mask.CopyFrom(FieldMask(paths=["amount_micros"]))
+        budget_mask: List[str] = []
+        if daily_budget is not None:
+            budget.amount_micros = int(round(daily_budget * 1_000_000))
+            budget_mask.append("amount_micros")
+            updated.append("daily_budget")
+        if needs_budget_flip:
+            budget.explicitly_shared = False
+            budget_mask.append("explicitly_shared")
+        budget_op.update_mask.CopyFrom(FieldMask(paths=budget_mask))
         _mutate(
             client, budget_service.mutate_campaign_budgets,
             "MutateCampaignBudgetsRequest", customer_id, [budget_op],
         )
-        updated.append("daily_budget")
 
     # 2. Campaign-level mutation (name/status/bidding_strategy)
     needs_campaign_mutation = any(v is not None for v in (name, status, bidding_strategy))
@@ -379,10 +403,30 @@ def update_campaign(
             updated.append("bidding_strategy")
 
         op.update_mask.CopyFrom(FieldMask(paths=mask_paths))
-        _mutate(
-            client, campaign_service.mutate_campaigns,
-            "MutateCampaignsRequest", customer_id, [op],
-        )
+        try:
+            _mutate(
+                client, campaign_service.mutate_campaigns,
+                "MutateCampaignsRequest", customer_id, [op],
+            )
+        except GoogleAdsException as e:
+            # TARGET_CPA / TARGET_ROAS need real conversion history. The sandbox
+            # (and any new account) returns "operation is not allowed for the
+            # given context" — a Google Ads constraint, not a fixable bug. Surface
+            # a clear explanation instead of the raw API error.
+            if bidding_strategy_upper in ("TARGET_CPA", "TARGET_ROAS"):
+                for err in e.failure.errors:
+                    if "operation is not allowed" in err.message.lower():
+                        return {
+                            "campaign_id": campaign_id,
+                            "updated_fields": updated,
+                            "error": (
+                                f"{bidding_strategy_upper} requires conversion history on the account. "
+                                "If this is a new account or sandbox with no conversion data, "
+                                "Google Ads will reject the strategy switch. Use MAXIMIZE_CONVERSIONS "
+                                "or MAXIMIZE_CONVERSION_VALUE to let Smart Bidding gather data first."
+                            ),
+                        }
+            raise
 
     return {"campaign_id": campaign_id, "updated_fields": updated}
 
