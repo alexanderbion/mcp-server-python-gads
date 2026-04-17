@@ -297,14 +297,17 @@ def _apply_bidding_strategy_for_update(
         which can't run without a concrete target value.
     """
     s = strategy.upper()
+    # SetInParent must be called on the raw proto (._pb), not the proto-plus
+    # wrapper — the wrapper interprets attribute access as a field lookup and
+    # raises "Unknown field for <Strategy>: SetInParent" otherwise.
     if s == "MAXIMIZE_CLICKS":
-        campaign.target_spend.SetInParent()
+        campaign.target_spend._pb.SetInParent()
         return ["target_spend"]
     if s == "MAXIMIZE_CONVERSIONS":
-        campaign.maximize_conversions.SetInParent()
+        campaign.maximize_conversions._pb.SetInParent()
         return ["maximize_conversions"]
     if s == "MAXIMIZE_CONVERSION_VALUE":
-        campaign.maximize_conversion_value.SetInParent()
+        campaign.maximize_conversion_value._pb.SetInParent()
         return ["maximize_conversion_value"]
     if s == "TARGET_CPA":
         if target_cpa is None:
@@ -317,7 +320,7 @@ def _apply_bidding_strategy_for_update(
         campaign.target_roas.target_roas = target_roas
         return ["target_roas.target_roas"]
     if s == "MANUAL_CPC":
-        campaign.manual_cpc.SetInParent()
+        campaign.manual_cpc._pb.SetInParent()
         return ["manual_cpc"]
     raise ValueError(
         f"Unsupported bidding_strategy: '{strategy}'. "
@@ -411,21 +414,18 @@ def update_campaign(
         except GoogleAdsException as e:
             # TARGET_CPA / TARGET_ROAS need real conversion history. The sandbox
             # (and any new account) returns "operation is not allowed for the
-            # given context" — a Google Ads constraint, not a fixable bug. Surface
-            # a clear explanation instead of the raw API error.
+            # given context" — a Google Ads constraint, not a fixable bug. Raise
+            # a ValueError so the server's error handler returns an error-only
+            # response (no contradictory status: success envelope).
             if bidding_strategy_upper in ("TARGET_CPA", "TARGET_ROAS"):
                 for err in e.failure.errors:
                     if "operation is not allowed" in err.message.lower():
-                        return {
-                            "campaign_id": campaign_id,
-                            "updated_fields": updated,
-                            "error": (
-                                f"{bidding_strategy_upper} requires conversion history on the account. "
-                                "If this is a new account or sandbox with no conversion data, "
-                                "Google Ads will reject the strategy switch. Use MAXIMIZE_CONVERSIONS "
-                                "or MAXIMIZE_CONVERSION_VALUE to let Smart Bidding gather data first."
-                            ),
-                        }
+                        raise ValueError(
+                            f"{bidding_strategy_upper} requires conversion history on the account. "
+                            "If this is a new account or sandbox with no conversion data, "
+                            "Google Ads will reject the strategy switch. Use MAXIMIZE_CONVERSIONS "
+                            "or MAXIMIZE_CONVERSION_VALUE to let Smart Bidding gather data first."
+                        )
             raise
 
     return {"campaign_id": campaign_id, "updated_fields": updated}

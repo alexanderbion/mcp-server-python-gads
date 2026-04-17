@@ -174,8 +174,14 @@ def _check(errors: list[str]) -> str | None:
 
 
 def _format_google_ads_error(exc: GoogleAdsException) -> str:
-    """Extract a readable error message from a GoogleAdsException."""
-    errors = []
+    """Extract a readable error message from a GoogleAdsException.
+
+    When a batched mutate fails, Google Ads returns the real error plus a
+    cascade of "Resource was not found" errors for every dependent operation
+    that couldn't resolve its parent. Surface just the first terminal error
+    so callers see the root cause, not the rollback noise.
+    """
+    formatted: list[str] = []
     for error in exc.failure.errors:
         msg = error.message
         if hasattr(error, "details") and error.details:
@@ -184,8 +190,14 @@ def _format_google_ads_error(exc: GoogleAdsException) -> str:
                 msg = f"Policy violation: {v.external_policy_name}"
                 if hasattr(v, "key") and v.key and v.key.violating_text:
                     msg += f' (violating text: "{v.key.violating_text}")'
-        errors.append(msg)
-    return "; ".join(errors) if errors else str(exc)
+        formatted.append(msg)
+    if not formatted:
+        return str(exc)
+    terminal = next(
+        (m for m in formatted if "was not found" not in m.lower()),
+        formatted[0],
+    )
+    return terminal
 
 
 def _handle_errors(fn):
