@@ -15,10 +15,11 @@ VALID_BIDDING_STRATEGIES = {
     "MAXIMIZE_CLICKS",
     "MAXIMIZE_CONVERSIONS",
     "MAXIMIZE_CONVERSION_VALUE",
-    "ENHANCED_CPC",
     "TARGET_CPA",
     "TARGET_ROAS",
 }
+
+DEPRECATED_BIDDING_STRATEGIES = {"ENHANCED_CPC"}
 
 VALID_CAMPAIGN_STATUSES = {"ENABLED", "PAUSED", "REMOVED"}
 
@@ -69,7 +70,14 @@ def validate_match_type(match_type: str, field: str = "match_type") -> list[str]
 
 
 def validate_bidding_strategy(strategy: str) -> list[str]:
-    if strategy.upper() not in VALID_BIDDING_STRATEGIES:
+    s = strategy.upper()
+    if s in DEPRECATED_BIDDING_STRATEGIES:
+        return [
+            f"bidding_strategy: '{strategy}' is deprecated by Google Ads. "
+            "Use MANUAL_CPC or a Smart Bidding strategy "
+            "(MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS, MAXIMIZE_CONVERSION_VALUE, TARGET_CPA, TARGET_ROAS)."
+        ]
+    if s not in VALID_BIDDING_STRATEGIES:
         opts = ", ".join(sorted(VALID_BIDDING_STRATEGIES))
         return [f"bidding_strategy: '{strategy}' invalid — must be one of: {opts}"]
     return []

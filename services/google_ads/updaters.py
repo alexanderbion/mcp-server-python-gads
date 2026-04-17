@@ -276,38 +276,43 @@ def _apply_bidding_strategy_for_update(
     client: GoogleAdsClient, campaign, strategy: str,
     target_cpa: Optional[float], target_roas: Optional[float],
 ) -> List[str]:
-    """Apply bidding strategy and return field-mask paths needed."""
+    """Set the right oneof submessage for a bidding-strategy switch and return mask paths.
+
+    Google Ads rejects parent-message paths in field masks (e.g. 'target_spend')
+    with "field mask updated a field with subfields" — paths must reach into a
+    subfield (e.g. 'target_spend.cpc_bid_ceiling_micros'). For strategies whose
+    only configurable field defaults to 0/False we still set + include the
+    subfield path explicitly; the API uses the populated oneof to switch
+    strategy regardless of the subfield value.
+    """
     s = strategy.upper()
     if s == "MAXIMIZE_CLICKS":
-        client.copy_from(campaign.target_spend, client.get_type("TargetSpend"))
-        return ["target_spend"]
+        campaign.target_spend.cpc_bid_ceiling_micros = 0
+        return ["target_spend.cpc_bid_ceiling_micros"]
     if s == "MAXIMIZE_CONVERSIONS":
-        client.copy_from(campaign.maximize_conversions, client.get_type("MaximizeConversions"))
-        return ["maximize_conversions"]
+        campaign.maximize_conversions.target_cpa_micros = 0
+        return ["maximize_conversions.target_cpa_micros"]
     if s == "MAXIMIZE_CONVERSION_VALUE":
-        client.copy_from(
-            campaign.maximize_conversion_value, client.get_type("MaximizeConversionValue")
-        )
-        return ["maximize_conversion_value"]
+        campaign.maximize_conversion_value.target_roas = 0.0
+        return ["maximize_conversion_value.target_roas"]
     if s == "TARGET_CPA":
-        target = client.get_type("TargetCpa")
-        if target_cpa is not None:
-            target.target_cpa_micros = int(round(target_cpa * 1_000_000))
-        client.copy_from(campaign.target_cpa, target)
-        return ["target_cpa.target_cpa_micros"] if target_cpa is not None else ["target_cpa"]
+        if target_cpa is None:
+            raise ValueError("target_cpa is required when bidding_strategy=TARGET_CPA")
+        campaign.target_cpa.target_cpa_micros = int(round(target_cpa * 1_000_000))
+        return ["target_cpa.target_cpa_micros"]
     if s == "TARGET_ROAS":
-        target = client.get_type("TargetRoas")
-        if target_roas is not None:
-            target.target_roas = target_roas
-        client.copy_from(campaign.target_roas, target)
-        return ["target_roas.target_roas"] if target_roas is not None else ["target_roas"]
-    if s == "ENHANCED_CPC":
-        client.copy_from(campaign.manual_cpc, client.get_type("ManualCpc"))
-        campaign.manual_cpc.enhanced_cpc_enabled = True
+        if target_roas is None:
+            raise ValueError("target_roas is required when bidding_strategy=TARGET_ROAS")
+        campaign.target_roas.target_roas = target_roas
+        return ["target_roas.target_roas"]
+    if s == "MANUAL_CPC":
+        campaign.manual_cpc.enhanced_cpc_enabled = False
         return ["manual_cpc.enhanced_cpc_enabled"]
-    # MANUAL_CPC default
-    client.copy_from(campaign.manual_cpc, client.get_type("ManualCpc"))
-    return ["manual_cpc"]
+    raise ValueError(
+        f"Unsupported bidding_strategy: '{strategy}'. "
+        "Use MANUAL_CPC, MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS, "
+        "MAXIMIZE_CONVERSION_VALUE, TARGET_CPA, or TARGET_ROAS."
+    )
 
 
 def update_campaign(

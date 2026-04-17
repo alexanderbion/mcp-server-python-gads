@@ -202,9 +202,15 @@ def get_campaign_extensions(client: GoogleAdsClient, customer_id: str, campaign_
 
 
 def get_campaign_targeting(client: GoogleAdsClient, customer_id: str, campaign_id: str) -> Dict[str, List[str]]:
-    """Gets location and language targeting for a campaign."""
+    """Gets location and language targeting for a campaign.
+
+    Returns geo_targets (included) and excluded_geo_targets (negative location
+    criteria) as separate lists so callers don't need to know about the
+    negative flag to distinguish them.
+    """
     query = f"""
-        SELECT campaign_criterion.type, campaign_criterion.location.geo_target_constant,
+        SELECT campaign_criterion.type, campaign_criterion.negative,
+               campaign_criterion.location.geo_target_constant,
                campaign_criterion.language.language_constant
         FROM campaign_criterion
         WHERE campaign_criterion.campaign = 'customers/{customer_id}/campaigns/{campaign_id}'
@@ -217,14 +223,24 @@ def get_campaign_targeting(client: GoogleAdsClient, customer_id: str, campaign_i
 
     results = execute_with_retry(service.search, request=request)
     geo_targets = []
+    excluded_geo_targets = []
     languages = []
     for row in results:
-        ctype = row.campaign_criterion.type_.name
+        c = row.campaign_criterion
+        ctype = c.type_.name
         if ctype == "LOCATION":
-            geo_targets.append(row.campaign_criterion.location.geo_target_constant)
+            geo = c.location.geo_target_constant
+            if c.negative:
+                excluded_geo_targets.append(geo)
+            else:
+                geo_targets.append(geo)
         elif ctype == "LANGUAGE":
-            languages.append(row.campaign_criterion.language.language_constant)
-    return {"geo_targets": geo_targets, "languages": languages}
+            languages.append(c.language.language_constant)
+    return {
+        "geo_targets": geo_targets,
+        "excluded_geo_targets": excluded_geo_targets,
+        "languages": languages,
+    }
 
 
 # ── Read functions for Exclusions Tab ─────────────────────────────────

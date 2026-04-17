@@ -43,6 +43,11 @@ def _apply_bidding_strategy(
 ) -> None:
     """Apply a bidding strategy to a campaign proto by setting the right oneof field."""
     s = strategy.upper()
+    if s == "ENHANCED_CPC":
+        raise ValueError(
+            "ENHANCED_CPC was deprecated by Google Ads in October 2022. "
+            "Use MAXIMIZE_CONVERSIONS or MAXIMIZE_CONVERSION_VALUE instead."
+        )
     if s == "MAXIMIZE_CLICKS":
         client.copy_from(campaign.target_spend, client.get_type("TargetSpend"))
     elif s == "MAXIMIZE_CONVERSIONS":
@@ -59,9 +64,6 @@ def _apply_bidding_strategy(
         if target_roas is not None:
             target.target_roas = target_roas
         client.copy_from(campaign.target_roas, target)
-    elif s == "ENHANCED_CPC":
-        client.copy_from(campaign.manual_cpc, client.get_type("ManualCpc"))
-        campaign.manual_cpc.enhanced_cpc_enabled = True
     else:
         client.copy_from(campaign.manual_cpc, client.get_type("ManualCpc"))
 
@@ -120,13 +122,14 @@ def _build_keyword_mutate_operations(
         op = client.get_type("MutateOperation")
         criterion = op.ad_group_criterion_operation.create
         criterion.ad_group = ad_group_resource
-        criterion.status = _criterion_status_enum(client, status)
         criterion.keyword.text = kw["text"]
         criterion.keyword.match_type = getattr(
             client.enums.KeywordMatchTypeEnum, kw["match_type"].upper()
         )
         if kw.get("negative"):
             criterion.negative = True
+        else:
+            criterion.status = _criterion_status_enum(client, status)
         ops.append(op)
     return ops
 

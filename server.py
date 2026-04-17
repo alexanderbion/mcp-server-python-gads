@@ -453,7 +453,7 @@ async def create_campaign(
         campaign_negative_keywords_json: JSON array of negatives written at CAMPAIGN level (apply to all ad groups). Same format as keywords_json.
         ad_group_negative_keywords_json: JSON array of negatives written at AD GROUP level (apply only to the main ad group created here). Same format as keywords_json.
         negative_keywords_json: DEPRECATED — kept for backwards compatibility. Maps to ad_group_negative_keywords_json.
-        bidding_strategy: One of MANUAL_CPC, MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS, MAXIMIZE_CONVERSION_VALUE, ENHANCED_CPC, TARGET_CPA, TARGET_ROAS
+        bidding_strategy: One of MANUAL_CPC, MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS, MAXIMIZE_CONVERSION_VALUE, TARGET_CPA, TARGET_ROAS
         target_cpa: Required when bidding_strategy=TARGET_CPA. Local currency.
         target_roas: Required when bidding_strategy=TARGET_ROAS. Decimal e.g. 4.0 = 400% ROAS.
         language_ids: Single int or list of language constants (1000=English, 1001=French, 1002=German, 1003=Spanish, 1004=Italian, 1005=Russian, 1009=Portuguese, 1015=Dutch, 1030=Polish, 1037=Turkish)
@@ -675,7 +675,7 @@ async def update_campaign(
         name: New campaign name
         status: 'ENABLED' | 'PAUSED' | 'REMOVED'
         daily_budget: New daily budget in account local currency (e.g. 5.0)
-        bidding_strategy: One of MANUAL_CPC, MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS, MAXIMIZE_CONVERSION_VALUE, ENHANCED_CPC, TARGET_CPA, TARGET_ROAS
+        bidding_strategy: One of MANUAL_CPC, MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS, MAXIMIZE_CONVERSION_VALUE, TARGET_CPA, TARGET_ROAS
         target_cpa: Required when bidding_strategy=TARGET_CPA. Local currency.
         target_roas: Required when bidding_strategy=TARGET_ROAS. Decimal e.g. 4.0 = 400% ROAS.
     """
